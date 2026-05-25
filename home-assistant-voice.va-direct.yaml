@@ -1731,19 +1731,18 @@ micro_wake_word:
               then:
                 - switch.turn_off: timer_ringing
               else:
-                # Distinguish stop word from regular wake words.
-                # `wake_word` is the trigger variable injected by micro_wake_word.
+                # Branch on the assistant's current phase, mirroring the
+                # original yaml's `voice_assistant.is_running` check. Any
+                # wake word fired while we're actively replying = interrupt
+                # request, regardless of which model triggered. Idle/listening/
+                # thinking → fresh session.
                 - if:
                     condition:
-                      # mww injects wake_word as the model's display name —
-                      # the "stop" model resolves to "Stop" (capital S), and
-                      # we want to be tolerant of other capitalisations too.
-                      lambda: 'return wake_word == "Stop" || wake_word == "stop";'
+                      lambda: 'return id(voice_assistant_phase) == ${voice_assist_replying_phase_id};'
                     then:
-                      # Stop word: interrupt the active reply, flush the
-                      # speaker queue so audio stops immediately, drop
-                      # back to listening. No wake-sound chime here —
-                      # the user is interrupting, not starting fresh.
+                      # Interrupt the active reply. Flush the queue + stop
+                      # the resampler so audio cuts immediately. No wake
+                      # chime — user is barging in, not starting fresh.
                       - lambda: 'id(va)->send_interrupt();'
                       - speaker.stop:
                           id: media_resampling_speaker
