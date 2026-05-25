@@ -253,6 +253,16 @@ void VaClient::handle_text_(const char *data, size_t len) {
     return;
   }
 
+  if (msg.find("\"type\":\"request_follow_up\"") != std::string::npos) {
+    // Server's model called the request_follow_up tool — it asked a
+    // question and wants the user to answer without saying a wake word.
+    // Open a one-shot follow-up window regardless of kFollowupMs (which
+    // we keep at 0 by default to avoid speaker echo).
+    ESP_LOGI(TAG, "request_follow_up — opening %u ms mic window", (unsigned) kRequestFollowUpMs);
+    this->open_followup_window_(kRequestFollowUpMs);
+    return;
+  }
+
   // Substring match on `"value":"<phase>"` — keeps us out of a JSON parser
   // until M3 needs richer payloads.
   static const char *const kPhases[] = {"listening", "thinking", "replying", "idle"};
@@ -466,7 +476,7 @@ void VaClient::start_session() {
   });
 }
 
-void VaClient::open_followup_window_() {
+void VaClient::open_followup_window_(uint32_t duration_ms) {
   // If a phase=idle LED transition was held back while audio drained, fire
   // it now so the LED goes to idle in sync with the speaker actually going
   // quiet (instead of as soon as the server emitted response.done).
@@ -498,16 +508,16 @@ void VaClient::open_followup_window_() {
       this->turn_t_wake_ = 0;  // mark turn as logged
     }
   }
-  if (kFollowupMs == 0) {
-    // Follow-up disabled: turn-based behaviour like the original pipeline.
-    // After the LED idle emit above, leave the mic closed; user must say
-    // a wake word for the next turn.
+  if (duration_ms == 0) {
+    // Follow-up disabled for this call: turn-based behaviour like the
+    // original pipeline. Leave the mic closed; user must say a wake word
+    // for the next turn.
     this->streaming_ = false;
     return;
   }
-  ESP_LOGI(TAG, "follow-up window open (mic on for %u ms)", (unsigned) kFollowupMs);
+  ESP_LOGI(TAG, "follow-up window open (mic on for %u ms)", (unsigned) duration_ms);
   this->streaming_ = true;
-  this->set_timeout("va_followup", kFollowupMs, [this]() {
+  this->set_timeout("va_followup", duration_ms, [this]() {
     if (this->streaming_) {
       ESP_LOGI(TAG, "follow-up window expired — mic streaming off");
       this->streaming_ = false;

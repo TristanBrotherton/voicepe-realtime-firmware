@@ -46,7 +46,7 @@ class VaClient : public Component {
   void handle_text_(const char *data, size_t len);
   void handle_binary_(const uint8_t *data, size_t len);
   void set_phase_(const std::string &phase);
-  void open_followup_window_();
+  void open_followup_window_(uint32_t duration_ms = kFollowupMs);
 
   std::string url_;
   std::string token_;
@@ -110,6 +110,11 @@ class VaClient : public Component {
   // hears its own TTS tail during this window. Re-enable (e.g. 5000)
   // when AEC is tuned or we add wait_for_user on the server.
   static constexpr uint32_t kFollowupMs = 0;
+  // Used when the server explicitly requests a follow-up via the
+  // request_follow_up tool — overrides kFollowupMs for a single turn.
+  // Longer than the default because the model asked a real question
+  // and the user might pause before answering.
+  static constexpr uint32_t kRequestFollowUpMs = 10000;
   // After start_session() we wait this long for the server to emit
   // phase=listening (i.e. server VAD heard speech). If nothing comes, the
   // user pressed wake/button and stayed silent — close the session so we
