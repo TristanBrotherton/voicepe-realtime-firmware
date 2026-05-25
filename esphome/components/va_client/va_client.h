@@ -12,6 +12,7 @@ namespace esphome {
 namespace va_client {
 
 class OnPhaseTrigger;
+class OnRepeatedFailureTrigger;
 
 class VaClient : public Component {
  public:
@@ -21,6 +22,9 @@ class VaClient : public Component {
   void set_mic_channel(uint8_t c) { mic_channel_ = c; }
   void set_speaker(speaker::Speaker *s) { speaker_ = s; }
   void add_on_phase_trigger(OnPhaseTrigger *t) { phase_triggers_.push_back(t); }
+  void add_on_repeated_failure_trigger(OnRepeatedFailureTrigger *t) {
+    repeated_failure_triggers_.push_back(t);
+  }
 
   bool is_connected() const { return ws_connected_; }
 
@@ -65,6 +69,20 @@ class VaClient : public Component {
 
   std::string current_phase_{"idle"};
   std::vector<OnPhaseTrigger *> phase_triggers_;
+  std::vector<OnRepeatedFailureTrigger *> repeated_failure_triggers_;
+
+  // Counts consecutive failed reconnect attempts. Reset to 0 on a clean
+  // WS_CONNECTED event. When it hits kRepeatedFailureThreshold we fire the
+  // on_repeated_failure trigger exactly once (until the count resets) — yaml
+  // plays an audible error chime so the user knows the link is dead.
+  uint32_t consecutive_failures_{0};
+  bool repeated_failure_fired_{false};
+  static constexpr uint32_t kRepeatedFailureThreshold = 5;
+  // Don't reset the failure counter/flag the moment WS reconnects — a
+  // flapping link (connect → 2 s later disconnect → 5 more fails → another
+  // chime) would spam the user. Require kStableConnectionMs of unbroken
+  // uptime before declaring "we're properly back" and re-arming the chime.
+  static constexpr uint32_t kStableConnectionMs = 30000;
 
   // Scratch buffers reused on the hot path to avoid per-callback heap allocation.
   std::vector<int16_t> mono_buf_;
@@ -92,11 +110,15 @@ class VaClient : public Component {
   // user pressed wake/button and stayed silent — close the session so we
   // don't sit there with the mic open eating OpenAI minutes.
   static constexpr uint32_t kNoSpeechTimeoutMs = 7000;
-  // After our PSRAM queue drains there's still ~500–700 ms in the
-  // downstream chain (resampler + mixer + i2s_audio buffer_duration). Wait
-  // that long before opening the mic so it doesn't pick up the tail of
-  // our own TTS and re-trigger the server VAD.
-  static constexpr uint32_t kFollowupOpenDelayMs = 800;
+  // After our PSRAM queue drains there's still audio in flight:
+  //   resampler ring 4800 B (≈ 50 ms)
+  //   mixer source buffer 100 ms
+  //   i2s_audio_speaker buffer_duration 500 ms
+  //   XMOS DSP pipeline / DAC analog tail ≈ 100 ms
+  // Sum ≈ 750 ms. We add headroom so a slow drain doesn't leak TTS into
+  // the mic — every leak triggers the server VAD because the XMOS AEC
+  // doesn't fully cancel our own speaker output (M3.2 measured ~10× leak).
+  static constexpr uint32_t kFollowupOpenDelayMs = 1500;
 
   // Tracks the opcode of the in-flight WS message so we can route
   // continuation frames (op_code = 0) to the same handler.

@@ -387,7 +387,13 @@ binary_sensor:
                                                   id: play_sound
                                                   priority: true
                                                   sound_file: "center_button_press_sound"
-                                              - delay: 300ms
+                                              - wait_until:
+                                                  condition:
+                                                    not:
+                                                      media_player.is_announcing:
+                                                        id: external_media_player
+                                                  timeout: 2s
+                                              - delay: 600ms
                                               - lambda: 'id(va)->start_session();'
                                               - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
                                               - script.execute: control_leds
@@ -1717,6 +1723,17 @@ va_client:
           - micro_wake_word.enable_model: stop
         else:
           - micro_wake_word.disable_model: stop
+  on_repeated_failure:
+    # Backend has been unreachable for N reconnect attempts in a row.
+    # Play the error chime once so the user knows something's wrong —
+    # the LED is already in no_ha_connection (red twinkle) but that's
+    # easy to miss across the room.
+    - script.execute:
+        id: play_sound
+        priority: true
+        # audio_file id is `error_cloud_expired` (no "_sound" suffix),
+        # unlike the other chimes — original yaml inconsistency.
+        sound_file: "error_cloud_expired"
 
 audio_dac:
   - platform: aic3204
@@ -1781,7 +1798,21 @@ micro_wake_word:
                                 id: play_sound
                                 priority: true
                                 sound_file: "wake_word_triggered_sound"
-                            - delay: 300ms
+                            # Wait until the chime has actually finished
+                            # playing through the speaker — a fixed 300ms
+                            # delay was racing with the ~500ms FLAC and the
+                            # mic was streaming the chime tail to OpenAI
+                            # (which transcribed it as "Ok, nabór").
+                            - wait_until:
+                                condition:
+                                  not:
+                                    media_player.is_announcing:
+                                      id: external_media_player
+                                timeout: 2s
+                            # Plus the downstream speaker ring buffer is
+                            # still ~600ms behind — wait a bit more so the
+                            # mic only catches the user's actual command.
+                            - delay: 600ms
                       - lambda: 'id(va)->start_session();'
                       # Show "waiting for command" (blue spin) immediately on wake,
                       # before the server VAD detects actual speech. va_client's

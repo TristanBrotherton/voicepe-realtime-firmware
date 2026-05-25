@@ -141,6 +141,22 @@ void VaClient::schedule_reconnect_() {
   }
   this->reconnect_pending_ = true;
 
+  // One per *failure* (coalesced), not per individual WS event. Once we
+  // cross the threshold fire the audible-error trigger exactly once until
+  // a successful connect resets the counter.
+  this->consecutive_failures_++;
+  if (this->consecutive_failures_ >= kRepeatedFailureThreshold &&
+      !this->repeated_failure_fired_) {
+    this->repeated_failure_fired_ = true;
+    ESP_LOGW(TAG, "%u consecutive reconnect failures — firing on_repeated_failure",
+             (unsigned) this->consecutive_failures_);
+    this->defer([this]() {
+      for (auto *t : this->repeated_failure_triggers_) {
+        t->trigger();
+      }
+    });
+  }
+
   uint32_t delay = this->reconnect_delay_ms_;
   ESP_LOGI(TAG, "Scheduling reconnect in %u ms", (unsigned) delay);
   // Backoff schedule: 1s -> 2s -> 5s -> 10s (capped).
@@ -164,6 +180,17 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
       ESP_LOGI(TAG, "WS connected");
       this->ws_connected_ = true;
       this->reconnect_delay_ms_ = 1000;  // reset backoff on a clean open
+      // Don't reset the failure counter / fired flag yet — a flap-and-die
+      // link would spam chimes. Only re-arm after the connection has held
+      // for kStableConnectionMs without a disconnect.
+      this->set_timeout("va_stable_connection", kStableConnectionMs, [this]() {
+        if (this->ws_connected_) {
+          this->consecutive_failures_ = 0;
+          this->repeated_failure_fired_ = false;
+          ESP_LOGD(TAG, "WS stable for %u ms — error chime re-armed",
+                   (unsigned) kStableConnectionMs);
+        }
+      });
 
       const char start_msg[] = "{\"type\":\"start\"}";
       auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
@@ -203,6 +230,10 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
         ESP_LOGW(TAG, "WS disconnected (event %d)", (int) event_id);
       }
       this->ws_connected_ = false;
+      // Connection broke before the stability window elapsed — keep the
+      // failure counter and the fired flag. A flapping link won't earn
+      // a fresh chime.
+      this->cancel_timeout("va_stable_connection");
       this->set_phase_("idle");
       this->schedule_reconnect_();
       break;
@@ -302,6 +333,7 @@ void VaClient::set_phase_(const std::string &phase) {
   // Don't dedupe — we want yaml-side control_leds to re-render even on
   // identical phase if other inputs (e.g. va WS connection state) have
   // changed since the last emission.
+  const std::string prev_phase = this->current_phase_;
   this->current_phase_ = phase;
   ESP_LOGD(TAG, "Phase -> %s", phase.c_str());
 
@@ -340,7 +372,16 @@ void VaClient::set_phase_(const std::string &phase) {
     this->followup_pending_ = false;
     this->idle_emit_pending_ = false;  // new turn began, drop any held idle
   } else if (phase == "idle") {
-    if (this->suppress_followup_) {
+    // Only open a follow-up window if we just finished a real turn —
+    // i.e. the previous phase was thinking or replying. Otherwise we'd
+    // open the window for every spurious idle (initial WS hello, post-
+    // disconnect idle, etc), spamming "follow-up window open" logs and
+    // opening the mic for 5s every time the device just reconnects.
+    const bool turn_just_ended = prev_phase == "thinking" || prev_phase == "replying";
+    if (!turn_just_ended) {
+      // Plain idle (boot, reconnect, etc) — no follow-up. Fall through to
+      // the regular trigger fire so the LED updates.
+    } else if (this->suppress_followup_) {
       // send_interrupt() set this — user explicitly asked us to stop.
       // Close the session cleanly: streaming off, no follow-up, fall through
       // to the regular trigger fire so the LED goes idle.
