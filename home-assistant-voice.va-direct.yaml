@@ -364,19 +364,33 @@ binary_sensor:
                                   - media_player.pause:
                                       id: external_media_player
                                 else:
+                                  # If a va_client session is already in flight
+                                  # (any non-idle phase: waiting/listening/
+                                  # thinking/replying) — treat this press as
+                                  # "cancel". No wake chime, no new session.
+                                  # Otherwise: fresh start.
                                   - if:
                                       condition:
-                                        switch.is_off: master_mute_switch
+                                        lambda: 'return id(voice_assistant_phase) != ${voice_assist_idle_phase_id};'
                                       then:
                                         - lambda: 'id(va)->send_interrupt();'
-                                        - script.execute:
-                                            id: play_sound
-                                            priority: true
-                                            sound_file: "center_button_press_sound"
-                                        - delay: 300ms
-                                        - lambda: 'id(va)->start_session();'
-                                        - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
+                                        - speaker.stop:
+                                            id: media_resampling_speaker
+                                        - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
                                         - script.execute: control_leds
+                                      else:
+                                        - if:
+                                            condition:
+                                              switch.is_off: master_mute_switch
+                                            then:
+                                              - script.execute:
+                                                  id: play_sound
+                                                  priority: true
+                                                  sound_file: "center_button_press_sound"
+                                              - delay: 300ms
+                                              - lambda: 'id(va)->start_session();'
+                                              - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
+                                              - script.execute: control_leds
       # Double Click
       #  . Exposed as an event entity. To be used in automations inside Home Assistant
       - timing:

@@ -82,7 +82,16 @@ class VaClient : public Component {
   // trigger immediately the device looks idle while still speaking. Hold
   // the "idle" emission until the queue drains + kFollowupOpenDelayMs.
   bool idle_emit_pending_{false};
+  // Set by send_interrupt() so the phase=idle that follows from the server
+  // doesn't trigger a follow-up mic window. The user explicitly asked us to
+  // stop — they don't want the device sitting there listening.
+  bool suppress_followup_{false};
   static constexpr uint32_t kFollowupMs = 5000;
+  // After start_session() we wait this long for the server to emit
+  // phase=listening (i.e. server VAD heard speech). If nothing comes, the
+  // user pressed wake/button and stayed silent — close the session so we
+  // don't sit there with the mic open eating OpenAI minutes.
+  static constexpr uint32_t kNoSpeechTimeoutMs = 7000;
   // After our PSRAM queue drains there's still ~500–700 ms in the
   // downstream chain (resampler + mixer + i2s_audio buffer_duration). Wait
   // that long before opening the mic so it doesn't pick up the tail of
@@ -105,6 +114,15 @@ class VaClient : public Component {
   size_t audio_head_{0};  // read pos (next byte to play)
   size_t audio_tail_{0};  // write pos (next byte to fill)
   size_t audio_fill_{0};  // bytes currently queued (audio_tail_ ≥ audio_head_ when not wrapped)
+
+  // Per-turn latency anchors (millis()-relative). Captured at each state
+  // transition; flushed as one summary line when the deferred phase=idle
+  // emit fires (i.e. when the speaker has actually drained). Zero means
+  // "not yet hit this milestone this turn".
+  uint32_t turn_t_wake_{0};               // start_session() (wake-word handler)
+  uint32_t turn_t_listening_{0};          // server's first phase=listening
+  uint32_t turn_t_thinking_{0};           // server's phase=thinking (end-of-speech)
+  uint32_t turn_t_first_audio_out_{0};    // first binary chunk arrived from server
 };
 
 }  // namespace va_client
