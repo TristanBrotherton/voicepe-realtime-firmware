@@ -49,6 +49,14 @@ esphome:
       - script.execute: control_leds
       - delay: 1s
       - switch.turn_on: internal_speaker_amp
+      # va-direct: original on_client_connected did clear-init + start-mww +
+      # phase=idle. Replicate here. The control_leds dispatcher will route
+      # to no_ha_connection (red twinkle) until both wifi and va_client WS
+      # come up — then it falls through to the idle phase naturally.
+      - lambda: id(init_in_progress) = false;
+      - micro_wake_word.start:
+      - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+      - script.execute: control_leds
       # If after 10 minutes, the device is still initializing (It did not yet connect to Home Assistant), turn off the init_in_progress variable and run the script to refresh the LED status
       - delay: 10min
       - if:
@@ -260,18 +268,32 @@ switch:
     on_turn_off:
       # Disable stop wake word
       - micro_wake_word.disable_model: stop
-      # TODO va-direct: disable_repeat / play_sound scripts still reference external_media_player.
-      # - script.execute: disable_repeat
+      - script.execute: disable_repeat
       # Stop any current announcement (ie: stop the timer ring mid playback)
-      # TODO va-direct: no external_media_player / mixer_speaker after the rip — skipping ducking/stop.
+      - if:
+          condition:
+            media_player.is_announcing:
+              id: external_media_player
+          then:
+            media_player.stop:
+              announcement: true
+              id: external_media_player
+      # Set back ducking ratio to zero
+      - mixer_speaker.apply_ducking:
+          id: media_mixing_input
+          decibel_reduction: 0
+          duration: 1.0s
       # Refresh the LED ring
       - script.execute: control_leds
     on_turn_on:
-      # TODO va-direct: was apply_ducking on media_mixing_input
+      # Duck audio
+      - mixer_speaker.apply_ducking:
+          id: media_mixing_input
+          decibel_reduction: 20
+          duration: 0.0s
       # Enable stop wake word
       - micro_wake_word.enable_model: stop
       # Ring timer
-      # TODO va-direct: ring_timer -> play_sound -> external_media_player (will not work yet)
       - script.execute: ring_timer
       # Refresh LED
       - script.execute: control_leds
@@ -325,20 +347,36 @@ binary_sensor:
                     then:
                       - switch.turn_off: timer_ringing
                     else:
-                      # TODO va-direct: original behaviour cascaded through VA/announcements/media before
-                      # falling back to starting the assistant. With va_client + no media_player we
-                      # just send an interrupt (which is a no-op if no session is active) and start.
-                      - lambda: 'id(va)->send_interrupt();'
                       - if:
                           condition:
-                            switch.is_off: master_mute_switch
+                            media_player.is_announcing:
+                              id: external_media_player
                           then:
-                            - script.execute:
-                                id: play_sound
-                                priority: true
-                                sound_file: "center_button_press_sound"
-                            - delay: 300ms
-                            - lambda: 'id(va)->start_session();'
+                            media_player.stop:
+                              announcement: true
+                              id: external_media_player
+                          else:
+                            - if:
+                                condition:
+                                  media_player.is_playing:
+                                    id: external_media_player
+                                then:
+                                  - media_player.pause:
+                                      id: external_media_player
+                                else:
+                                  - if:
+                                      condition:
+                                        switch.is_off: master_mute_switch
+                                      then:
+                                        - lambda: 'id(va)->send_interrupt();'
+                                        - script.execute:
+                                            id: play_sound
+                                            priority: true
+                                            sound_file: "center_button_press_sound"
+                                        - delay: 300ms
+                                        - lambda: 'id(va)->start_session();'
+                                        - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
+                                        - script.execute: control_leds
       # Double Click
       #  . Exposed as an event entity. To be used in automations inside Home Assistant
       - timing:
@@ -708,7 +746,11 @@ light:
               it[9] = muted_color;
               it[10] = Color::BLACK;
             }
-            // TODO va-direct: previously checked external_media_player volume/mute; no media_player exists here.
+            if ( id(external_media_player).volume == 0.0f || id(external_media_player).is_muted() ) {
+              it[5] = Color::BLACK;
+              it[6] = muted_color;
+              it[7] = Color::BLACK;
+            }
       - addressable_lambda:
           name: "Voice kit startup failed"
           # update_interval: 16ms
@@ -730,7 +772,7 @@ light:
             Color color(light_color.get_red() * 255, light_color.get_green() * 255,
                   light_color.get_blue() * 255);
             Color silenced_color(255, 0, 0);
-            auto volume_ratio = 12.0f * 0.5f;  // TODO va-direct: was id(external_media_player).volume
+            auto volume_ratio = 12.0f * id(external_media_player).volume;
             for (uint8_t i = 0; i < 12; i++) {
               if (i <= volume_ratio) {
                 it[(6+i)%12] = color * min( 255.0f * (volume_ratio - i) , 255.0f ) ;
@@ -738,7 +780,9 @@ light:
                 it[(6+i)%12] = Color::BLACK;
               }
             }
-            // TODO va-direct: silenced indicator removed — no external_media_player to query.
+            if (id(external_media_player).volume == 0.0f) {
+              it[6] = silenced_color;
+            }
       - addressable_lambda:
           name: "Center Button Touched"
           update_interval: 16ms
@@ -886,48 +930,48 @@ light:
           name: "Jack Plugged"
           update_interval: 40ms
           lambda: |-
-              static uint8_t index = 0;
-              if (initial_run) {
-                index = 0;
-              }
-              auto light_color = id(led_ring).current_values;
-              Color color(light_color.get_red() * 255, light_color.get_green() * 255,
-                    light_color.get_blue() * 255);
-              if (index <= 6) {
-                for (uint8_t i = 0; i < 12; i++) {
-                  if (i == index) {
-                    it[i] = color;
-                  } else if (i == (12 - index) % 12) {
-                    it[i] = color;
-                  } else {
-                    it[i] = Color::BLACK;
-                  }
+            static uint8_t index = 0;
+            if (initial_run) {
+              index = 0;
+            }
+            auto light_color = id(led_ring).current_values;
+            Color color(light_color.get_red() * 255, light_color.get_green() * 255,
+                  light_color.get_blue() * 255);
+            if (index <= 6) {
+              for (uint8_t i = 0; i < 12; i++) {
+                if (i == index) {
+                  it[i] = color;
+                } else if (i == (12 - index) % 12) {
+                  it[i] = color;
+                } else {
+                  it[i] = Color::BLACK;
                 }
               }
-              index = (index + 1);
+            }
+            index = (index + 1);
       - addressable_lambda:
           name: "Jack Unplugged"
           update_interval: 40ms
           lambda: |-
-              static uint8_t index = 0;
-              if (initial_run) {
-                index = 0;
-              }
-              auto light_color = id(led_ring).current_values;
-              Color color(light_color.get_red() * 255, light_color.get_green() * 255,
-                    light_color.get_blue() * 255);
-              if (index <= 6) {
-                for (uint8_t i = 0; i < 12; i++) {
-                  if (i == 6 - index) {
-                    it[i] = color;
-                  } else if (i == (6 + index) % 12) {
-                    it[i] = color;
-                  } else {
-                    it[i] = Color::BLACK;
-                  }
+            static uint8_t index = 0;
+            if (initial_run) {
+              index = 0;
+            }
+            auto light_color = id(led_ring).current_values;
+            Color color(light_color.get_red() * 255, light_color.get_green() * 255,
+                  light_color.get_blue() * 255);
+            if (index <= 6) {
+              for (uint8_t i = 0; i < 12; i++) {
+                if (i == 6 - index) {
+                  it[i] = color;
+                } else if (i == (6 + index) % 12) {
+                  it[i] = color;
+                } else {
+                  it[i] = Color::BLACK;
                 }
               }
-              index = (index + 1);
+            }
+            index = (index + 1);
 
   # User facing LED ring. Remapping of the internal LEDs.
   # Exposed to be used by the user.
@@ -1025,7 +1069,7 @@ script:
             id(control_leds_improv_ble_state).execute();
           } else if (id(init_in_progress)) {
             id(control_leds_init_state).execute();
-          } else if (!id(wifi_id).is_connected()){  // va-direct: no api_id; wifi-only check
+          } else if (!id(wifi_id).is_connected() || !id(va)->is_connected()) {
             id(control_leds_no_ha_connection_state).execute();
           } else if (id(center_button).state) {
             id(control_leds_center_button_touched).execute();
@@ -1053,7 +1097,8 @@ script:
             id(control_leds_timer_ticking).execute();
           } else if (id(master_mute_switch).state) {
             id(control_leds_muted_or_silent).execute();
-          // TODO va-direct: dropped external_media_player volume/mute check (no media_player).
+          } else if (id(external_media_player).volume == 0.0f || id(external_media_player).is_muted()) {
+            id(control_leds_muted_or_silent).execute();
           } else if (id(voice_assistant_phase) == ${voice_assist_idle_phase_id}) {
             id(control_leds_voice_assistant_idle_phase).execute();
           }
@@ -1258,7 +1303,15 @@ script:
       increase_volume: bool  # True: Increase volume / False: Decrease volume.
     then:
       - delay: 16ms
-      # TODO va-direct: no external_media_player; volume control over WS not yet wired.
+      - if:
+          condition:
+            lambda: return increase_volume;
+          then:
+            - media_player.volume_up:
+                id: external_media_player
+          else:
+            - media_player.volume_down:
+                id: external_media_player
       - script.execute: control_leds
       - delay: 1s
       - lambda: id(dial_touched) = false;
@@ -1353,25 +1406,51 @@ script:
           priority: true
           sound_file: "timer_finished_sound"
 
-  # TODO va-direct: enable_repeat_one / disable_repeat used external_media_player + speaker_source.
-  # Stubbed out — timer ring won't actually repeat until we wire audio_file playback through
-  # i2s_audio_speaker directly (or expose a media_player wrapper around va_client).
   - id: enable_repeat_one
     then:
-      - lambda: 'ESP_LOGW("va-direct", "enable_repeat_one: not implemented");'
+      # Turn on the repeat mode and pause for 500 ms between playlist items/repeats
+      - media_player.repeat_one:
+          id: external_media_player
+          announcement: true
+      - speaker_source.set_playlist_delay:
+          id: external_media_player
+          pipeline: announcement
+          delay: 500ms
 
   - id: disable_repeat
     then:
-      - lambda: 'ESP_LOGW("va-direct", "disable_repeat: not implemented");'
+      # Turn off the repeat mode and pause for 0 ms between playlist items/repeats
+      - media_player.repeat_off:
+          id: external_media_player
+          announcement: true
+      - speaker_source.set_playlist_delay:
+          id: external_media_player
+          pipeline: announcement
+          delay: 0ms
 
   # Script executed when we want to play sounds on the device.
-  # TODO va-direct: route audio_file playback through i2s_audio_speaker directly.
+  # va-direct: restored verbatim from original. Routes through
+  # external_media_player → announcement_resampling_speaker → i2s_audio_speaker.
   - id: play_sound
     parameters:
       priority: bool
       sound_file: string
     then:
-      - lambda: 'ESP_LOGW("va-direct", "play_sound(%s) priority=%d not implemented", sound_file.c_str(), priority);'
+      - if:
+          condition:
+            lambda: return priority;
+          then:
+            - media_player.stop:
+                id: external_media_player
+                announcement: true
+      - lambda: |-
+          if ( (id(external_media_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_ANNOUNCING ) || priority) {
+            id(external_media_player)
+              ->make_call()
+              .set_media_url("audio-file://" + sound_file)
+              .set_announcement(true)
+              .perform();
+          }
 
   # TODO va-direct: timer queries used voice_assistant's get_timers() — va_client has no
   # such API yet. Stubbed; timer LED indication will not function until va_client exposes timers
@@ -1384,13 +1463,33 @@ script:
     then:
       - lambda: 'id(is_timer_active) = false;  // TODO va-direct: no timer API on va_client yet'
 
-  # TODO va-direct: stop wake-word arming was synchronised to media_player.is_announcing.
-  # For now we enable the stop model when the phase becomes "replying" and disable it on idle.
-  # The phase mapping in va_client/on_phase already toggles voice_assistant_phase; tie into that
-  # at a higher level once we figure out the cleanest spot.
+  # Script used activate the stop word if the TTS step is long.
+  # Why is this wrapped on a script?
+  #   Becasue we want to stop the sequence if the TTS step is faster than that.
+  #   This allows us to prevent having the deactivation of the stop word before its own activation.
   - id: activate_stop_word_once
     then:
-      - lambda: 'ESP_LOGW("va-direct", "activate_stop_word_once: not implemented");'
+      - wait_until:
+          condition:
+            media_player.is_announcing:
+              id: external_media_player
+          timeout: 5s
+      - delay: 1s
+      # Enable stop wake word
+      - if:
+          condition:
+            switch.is_off: timer_ringing
+          then:
+            - micro_wake_word.enable_model: stop
+            - wait_until:
+                not:
+                  media_player.is_announcing:
+                    id: external_media_player
+            - if:
+                condition:
+                  switch.is_off: timer_ringing
+                then:
+                  - micro_wake_word.disable_model: stop
 
 i2s_audio:
   - id: i2s_output
@@ -1431,9 +1530,55 @@ speaker:
     dac_type: external
     channel: stereo
     timeout: never
-    buffer_duration: 100ms
+    # va-direct: stock yaml uses 100ms because an FLAC/MP3 decoder fronts the
+    # chain and buffers ahead. We push raw PCM live from a WS — jitter in
+    # chunk arrival can starve a 100ms buffer between chunks, audible as a
+    # hiss / silence gaps. Bump to 500ms.
+    buffer_duration: 500ms
     audio_dac: aic3204_dac
 
+  # va-direct: restored from stock — mixer wraps the i2s leaf, two resamplers
+  # feed mixer inputs. The resampler/mixer chain handles 24k→48k upsample,
+  # mono→stereo, 16→32bit expansion AND drives the i2s leaf with the right
+  # startup handshake (which raw speaker.play() on the leaf was failing).
+  # va_client writes 24k mono pcm16 into announcement_resampling_speaker.
+  - platform: mixer
+    id: mixing_speaker
+    output_speaker: i2s_audio_speaker
+    num_channels: 2
+    task_stack_in_psram: true
+    source_speakers:
+      - id: announcement_mixing_input
+        timeout: never
+      - id: media_mixing_input
+        timeout: never
+
+  - platform: resampler
+    id: announcement_resampling_speaker
+    output_speaker: announcement_mixing_input
+    sample_rate: 48000
+    bits_per_sample: 16
+  - platform: resampler
+    id: media_resampling_speaker
+    output_speaker: media_mixing_input
+    sample_rate: 48000
+    bits_per_sample: 16
+
+media_player:
+  - platform: speaker_source
+    id: external_media_player
+    name: Media Player
+    announcement_pipeline:
+      format: FLAC
+      num_channels: 1
+      sample_rate: 48000
+      speaker: announcement_resampling_speaker
+      sources:
+        - audio_file_announcement_source
+        - http_announcement_source
+    volume_increment: 0.05
+    volume_min: 0.4
+    volume_max: 0.85
 
 sendspin:
   id: sendspin_hub
@@ -1516,13 +1661,23 @@ va_client:
   token: !secret va_device_token
   microphone: i2s_mics
   mic_channel: 0
-  speaker: i2s_audio_speaker
+  # Write raw PCM16 mono 24kHz into the media resampler. We use this lane
+  # (not announcement_resampling_speaker) because external_media_player
+  # is wired to the announcement pipeline and would treat each speaker.play()
+  # as a fresh announcement, cutting our previous chunk short. The media
+  # lane is otherwise unused (no music_pipeline configured).
+  speaker: media_resampling_speaker
   on_phase:
     - lambda: |-
-        if (phase == "idle") id(voice_assistant_phase) = 1;
-        else if (phase == "listening") id(voice_assistant_phase) = 3;
-        else if (phase == "thinking") id(voice_assistant_phase) = 4;
-        else if (phase == "replying") id(voice_assistant_phase) = 5;
+        if (phase == "idle") {
+          id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+        } else if (phase == "listening") {
+          id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
+        } else if (phase == "thinking") {
+          id(voice_assistant_phase) = ${voice_assist_thinking_phase_id};
+        } else if (phase == "replying") {
+          id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
+        }
     - script.execute: control_leds
 
 audio_dac:
@@ -1575,6 +1730,12 @@ micro_wake_word:
                           sound_file: "wake_word_triggered_sound"
                       - delay: 300ms
                 - lambda: 'id(va)->start_session();'
+                # Show "waiting for command" (blue spin) immediately on wake,
+                # before the server VAD detects actual speech. va_client's
+                # on_phase will overwrite to phase 3 (listening_for_command)
+                # once the server reports speech started.
+                - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
+                - script.execute: control_leds
 
 select:
   - platform: template
