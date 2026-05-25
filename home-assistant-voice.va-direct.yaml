@@ -86,7 +86,13 @@ esp32:
 wifi:
   id: wifi_id
   fast_connect: ${hidden_ssid}
+  # va-direct: provisioning happens via improv (BLE/serial). Once provisioned,
+  # credentials live in NVS — no inline ssid/password in this yaml.
+  ap:
+    ssid: "Voice PE Setup"
   on_connect:
+    - delay: 5s  # give improv results time to transmit
+    - ble.disable:
     - lambda: id(improv_ble_in_progress) = false;
     - script.execute: control_leds
     # Enable/disable Sendspin static adjustment delay if the jack is plugged in or not
@@ -112,6 +118,25 @@ logger:
 ota:
   - platform: esphome
     id: ota_esphome
+
+# va-direct: WiFi provisioning blocks moved out of factory.yaml into the main
+# config since we don't use the upstream two-tier factory build.
+improv_serial:
+
+esp32_ble:
+  name: ha-voice-pe
+
+esp32_improv:
+  authorizer: center_button
+  on_start:
+    - lambda: id(improv_ble_in_progress) = true;
+    - script.execute: control_leds
+  on_provisioned:
+    - lambda: id(improv_ble_in_progress) = false;
+    - script.execute: control_leds
+  on_stop:
+    - lambda: id(improv_ble_in_progress) = false;
+    - script.execute: control_leds
 
 i2c:
   - id: internal_i2c
