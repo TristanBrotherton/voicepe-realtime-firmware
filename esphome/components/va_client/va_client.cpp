@@ -408,6 +408,19 @@ void VaClient::send_interrupt() {
   const char msg[] = "{\"type\":\"interrupt\"}";
   auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
   esp_websocket_client_send_text(handle, msg, sizeof(msg) - 1, portMAX_DELAY);
+  // Flush our PSRAM playback queue — what's already been pushed into the
+  // resampler/mixer/leaf will still drain (~600 ms residual), but everything
+  // we have yet to hand off is dropped. The yaml side stops the resampler
+  // explicitly. Reset deferred state too so we don't accidentally hold an
+  // "idle" emit waiting for the (now-empty) queue.
+  this->audio_head_ = 0;
+  this->audio_tail_ = 0;
+  this->audio_fill_ = 0;
+  this->followup_pending_ = false;
+  this->idle_emit_pending_ = false;
+  this->cancel_timeout("va_followup");
+  this->cancel_timeout("va_followup_open");
+  ESP_LOGI(TAG, "send_interrupt — WS msg sent, queue flushed");
 }
 
 }  // namespace va_client

@@ -1735,7 +1735,10 @@ micro_wake_word:
                 # `wake_word` is the trigger variable injected by micro_wake_word.
                 - if:
                     condition:
-                      lambda: 'return wake_word == "stop";'
+                      # mww injects wake_word as the model's display name —
+                      # the "stop" model resolves to "Stop" (capital S), and
+                      # we want to be tolerant of other capitalisations too.
+                      lambda: 'return wake_word == "Stop" || wake_word == "stop";'
                     then:
                       # Stop word: interrupt the active reply, flush the
                       # speaker queue so audio stops immediately, drop
