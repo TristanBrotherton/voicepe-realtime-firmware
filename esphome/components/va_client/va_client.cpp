@@ -218,15 +218,20 @@ void VaClient::set_phase_(const std::string &phase) {
   this->current_phase_ = phase;
   ESP_LOGD(TAG, "Phase -> %s", phase.c_str());
 
-  // Drop any lingering TTS audio when we move into listening so we don't
-  // talk over the user.
-  if (phase == "listening" && this->speaker_ != nullptr) {
-    this->speaker_->stop();
-  }
-
-  for (auto *t : this->phase_triggers_) {
-    t->trigger(phase);
-  }
+  // set_phase_ may be called from the websocket task; ESPHome triggers and
+  // most component APIs are not thread-safe. Marshal the side effects onto
+  // the main loop via defer().
+  std::string phase_copy = phase;
+  this->defer([this, phase_copy]() {
+    // Drop any lingering TTS audio when we move into listening so we don't
+    // talk over the user.
+    if (phase_copy == "listening" && this->speaker_ != nullptr) {
+      this->speaker_->stop();
+    }
+    for (auto *t : this->phase_triggers_) {
+      t->trigger(phase_copy);
+    }
+  });
 }
 
 void VaClient::start_session() {
