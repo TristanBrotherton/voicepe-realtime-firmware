@@ -7,9 +7,10 @@
 **Architecture:** Voice PE captures audio via XMOS DSP, sends to voice-assistant over WS. voice-assistant bridges to OpenAI Realtime (audio-in/audio-out, single pipe), forwards tool calls to existing HA MCP client. TTS audio streams back to the device. Music/timers/media_player on Voice PE are dropped — this is a voice-only appliance.
 
 **Tech Stack:**
-- Firmware: ESPHome custom C++ component, esp-idf WebSocket client, libopus (M3+)
+- Firmware: ESPHome custom C++ component, esp-idf WebSocket client
 - voice-assistant: Node.js 24+, TypeScript, `ws`, OpenAI SDK, `vitest`, `pino`
-- Audio codecs: raw PCM16 (M1–M2), Opus 16/24 kHz (M3+)
+- Audio codec: raw PCM16 both directions (Opus dropped — see spec
+  "codec policy" section; LAN bandwidth is plentiful, ESP32 CPU isn't)
 - Infra: docker-compose on Raspberry Pi 5
 
 **Spec:** [docs/superpowers/specs/2026-05-25-voice-pe-direct-va-streaming-design.md](../specs/2026-05-25-voice-pe-direct-va-streaming-design.md)
@@ -39,7 +40,6 @@ Each task explicitly names which repo it's in. Cross-repo coordination happens a
 | `src/realtime/openaiRealtimeClient.ts` | Thin wrapper over OpenAI Realtime WS API |
 | `src/realtime/toolAdapter.ts` | Convert HA MCP tool list → Realtime tool schema; route tool_calls |
 | `src/realtime/audio/resample.ts` | Linear resampler 16↔24 kHz mono PCM16 |
-| `src/realtime/audio/opusCodec.ts` | (M3) Opus encode/decode wrapper |
 | `src/realtime/audio/format.ts` | PCM16 helpers (base64 ↔ Buffer) |
 | `src/realtime/metrics.ts` | Latency tracker (wake → first_audio_out etc.), pino logs |
 | `src/realtime/index.ts` | `startRealtimeServer({ port, token, agent })` entrypoint |
@@ -54,7 +54,7 @@ Each task explicitly names which repo it's in. Cross-repo coordination happens a
 
 | File | Change |
 | --- | --- |
-| `package.json` | Add `ws`, `@types/ws`. In M3: `@discordjs/opus`. |
+| `package.json` | Add `ws`, `@types/ws`. |
 | `src/cli/unified.ts` | Boot `startRealtimeServer` when `REALTIME_ENABLED=1` |
 | `src/config.ts` | Read `REALTIME_PORT`, `VA_DEVICE_TOKEN`, `OPENAI_REALTIME_MODEL` |
 
@@ -66,7 +66,7 @@ Each task explicitly names which repo it's in. Cross-repo coordination happens a
 | `esphome/components/va_client/va_client.h` | Class declaration |
 | `esphome/components/va_client/va_client.cpp` | WS client + audio queues |
 | `esphome/components/va_client/audio_queue.h` | Lock-free ring buffer for playback |
-| `esphome/components/va_client/opus_codec.cpp` | (M3) libopus wrappers |
+| ~~`opus_codec.cpp`~~ | Dropped — raw PCM16 stays end-to-end |
 | `home-assistant-voice.va-direct.yaml` | New top-level yaml — voice-only flavour |
 
 ### Firmware (modified) — M5
@@ -201,7 +201,7 @@ export type ServerMessage =
   | { type: 'phase'; value: Phase }
   | { type: 'error'; message: string }
   | { type: 'pong' }
-  | { type: 'hello'; audioOut: 'pcm' | 'opus' };
+  | { type: 'hello'; audioOut: 'pcm' };
 
 export function parseDeviceMessage(raw: string): DeviceMessage {
   const json = JSON.parse(raw);
@@ -1665,265 +1665,300 @@ git commit -m "docs: M2 baseline latency measurements"
 
 ---
 
-# M3 — Opus + interrupt + reliability
+# M3 — Polish + reliability
 
-**Goal:** Opus codec end-to-end (lower bandwidth, prep for non-LAN deployment); reliable interrupt via local "stop" wake word; reconnect with backoff and audible error.
+**Goal:** Stabilise the M2 experience. Stop wake-word becomes a proper
+interrupt (not a new session), echo cancellation gets verified end-to-end,
+on-device latency metrics, graceful error sounds, longer-form testing.
 
-## Task M3.1: Opus on va side
+> **Codec note.** M3 was originally "Opus + interrupt + reliability".
+> Opus is dropped: on a LAN deployment the 640 Kbit/s raw PCM16 stream
+> is trivial for wifi and the ESP32-S3 is busy enough running mww + I2S
+> + WS without an extra ~10 % core for libopus. See the spec's "Codec
+> policy" update.
+>
+> Several items the original M3 plan called out have already landed
+> in M2 stabilisation commits and are tracked under "Done before M3
+> started" at the bottom — they don't need separate tasks here.
 
-**Files:**
-- Modify: `voice-assistant/package.json`
-- Create: `voice-assistant/src/realtime/audio/opusCodec.ts`
-- Create: `voice-assistant/tests/realtime/opusCodec.test.ts`
+**Definition of done:**
+- Saying "stop" while the AI is replying cancels the active turn,
+  flushes the audio buffer, drops phase back to idle. NOT a fresh
+  wake-word session.
+- A short conversation (≥5 turns) plays cleanly without echo, without
+  the device hearing its own TTS, without dropped chunks.
+- A device log line at end of each turn summarises the relevant timings
+  (`wake → first_audio_in → speech_stopped → first_audio_out → drained`).
+- When va is unreachable, the device plays a discoverable error chime
+  through `play_sound` (not just LED) so the user knows something is
+  wrong without reading logs.
 
-- [ ] **Step 1: Install opus binding**
-
-```bash
-cd voice-assistant
-npm install @discordjs/opus
-```
-
-- [ ] **Step 2: Write the failing test**
-
-```ts
-// tests/realtime/opusCodec.test.ts
-import { describe, it, expect } from 'vitest';
-import { OpusEncoder16k, OpusDecoder24k } from '../../src/realtime/audio/opusCodec.js';
-
-describe('opus codec', () => {
-  it('encodes and decodes a 20ms frame round-trip', () => {
-    const enc = new OpusEncoder16k();
-    const dec = new OpusDecoder24k();
-    const pcmIn = Buffer.alloc(320 * 2); // 20ms @ 16kHz pcm16
-    for (let i = 0; i < 320; i++) {
-      pcmIn.writeInt16LE(Math.round(Math.sin(i / 10) * 8000), i * 2);
-    }
-    const opus = enc.encode(pcmIn);
-    expect(opus.length).toBeGreaterThan(0);
-    expect(opus.length).toBeLessThan(pcmIn.length);
-
-    const dec24 = new OpusDecoder24k();
-    // round-trip via 24kHz decoder requires matching encoder rate; here we
-    // only assert that 24k decoder accepts data from a matching encoder
-    const enc24 = new OpusEncoder16k(24000);
-    const opus24 = enc24.encode(Buffer.alloc(480 * 2));
-    const pcmOut = dec24.decode(opus24);
-    expect(pcmOut.length).toBe(480 * 2);
-  });
-});
-```
-
-- [ ] **Step 3: Implement**
-
-```ts
-// src/realtime/audio/opusCodec.ts
-import { OpusEncoder, OpusDecoder } from '@discordjs/opus';
-
-export class OpusEncoder16k {
-  private enc: OpusEncoder;
-  constructor(sampleRate: number = 16000) {
-    this.enc = new OpusEncoder(sampleRate, 1);
-  }
-  encode(pcm16: Buffer): Buffer {
-    return this.enc.encode(pcm16);
-  }
-}
-
-export class OpusDecoder24k {
-  private dec: OpusDecoder;
-  constructor(sampleRate: number = 24000) {
-    this.dec = new OpusDecoder(sampleRate, 1);
-  }
-  decode(opus: Buffer): Buffer {
-    return this.dec.decode(opus);
-  }
-}
-```
-
-- [ ] **Step 4: Wire into bridge**
-
-In `src/realtime/realtimeBridge.ts`, add format negotiation. When the device sends `{type:"hello", codec:"opus"}` in the first text frame, switch the bridge to opus mode:
-
-```ts
-// inside RealtimeBridge
-private deviceCodec: 'pcm' | 'opus' = 'pcm';
-private opusDec16k: OpusDecoder16k | null = null;
-private opusEnc24k: OpusEncoder24k | null = null;
-```
-
-Modify `handleDevice` to:
-- If text frame is `{type:"hello", codec:"opus"}`, set `deviceCodec='opus'`, init `opusDec16k`. Then reply `{type:"hello", audioOut:"opus"}`.
-- If binary and `deviceCodec==='opus'`, decode → resample 16→24 → forward.
-
-Modify `handleOpenAi` audio.delta:
-- If `deviceCodec==='opus'`, downsample 24→24 (no-op, but encode opus) and send opus binary to device.
-
-Add a `DeviceHelloSchema` to `protocol.ts`:
-
-```ts
-z.object({ type: z.literal('hello'), codec: z.union([z.literal('pcm'), z.literal('opus')]) }),
-```
-
-Add unit test for the schema.
-
-- [ ] **Step 5: Run all tests**
-
-```bash
-npm test
-```
-
-Expected: all pass.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add package.json package-lock.json src/realtime/audio/opusCodec.ts src/realtime/realtimeBridge.ts src/realtime/protocol.ts tests/realtime/
-git commit -m "feat(realtime): opus codec support negotiated via hello msg"
-```
-
-## Task M3.2: Opus on firmware
+## Task M3.1: Stop wake-word distinguishes from okay_nabu
 
 **Files:**
-- Modify: `home-assistant-voice-pe/esphome/components/va_client/__init__.py`
-- Modify: `esphome/components/va_client/va_client.h`
-- Modify: `esphome/components/va_client/va_client.cpp`
-- Create: `esphome/components/va_client/opus_codec.cpp`
-
-- [ ] **Step 1: Add libopus to platformio**
-
-In `__init__.py`, register the library:
-
-```python
-async def to_code(config):
-    var = cg.new_Pvariable(config[CONF_ID])
-    await cg.register_component(var, config)
-    cg.add_library("esp-libopus", "1.5.2")  # or whichever is in PIO registry
-    cg.add(var.set_url(config[CONF_URL]))
-    # ... rest
-```
-
-- [ ] **Step 2: Add config flag**
-
-```python
-CONF_CODEC = "codec"
-cv.Optional(CONF_CODEC, default="opus"): cv.one_of("pcm", "opus", lower=True),
-```
-
-And in `to_code`: `cg.add(var.set_codec(config[CONF_CODEC]))`.
-
-- [ ] **Step 3: Implement opus in va_client.cpp**
-
-Add `#include <opus.h>` (path may differ per library). Init `OpusEncoder` (16kHz mono, 20ms frame = 320 samples) and `OpusDecoder` (24kHz mono).
-
-In `on_mic_data_`, encode samples → send binary.
-
-In `on_ws_message_` for binary, decode → push to speaker.
-
-On WS open, before sending `{"type":"start"}`, send `{"type":"hello","codec":"opus"}`.
-
-- [ ] **Step 4: Compile and flash**
-
-```bash
-esphome run home-assistant-voice.va-direct.yaml --device <port>
-```
-
-- [ ] **Step 5: Manual smoke (same as M2.3 step 3)**
-
-Compare latency and bandwidth (look at WiFi RX/TX in HA dashboard or `iftop` on the Pi) against PCM baseline.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add esphome/components/va_client home-assistant-voice.va-direct.yaml
-git commit -m "feat(va_client): opus codec end-to-end"
-```
-
-## Task M3.3: Interrupt path
-
-**Files:**
-- Modify: `voice-assistant/src/realtime/realtimeBridge.ts` (already handles interrupt — verify)
 - Modify: `home-assistant-voice-pe/home-assistant-voice.va-direct.yaml`
+  (the `micro_wake_word.on_wake_word_detected:` action chain)
 
-- [ ] **Step 1: Verify va-side interrupt cancels response**
+The chain currently fires `id(va)->start_session()` for ANY detected
+wake word, including `stop`. We want `stop` to call `send_interrupt()`
+instead.
 
-Add integration test:
+ESPHome's `on_wake_word_detected` passes the detected model's id via a
+`wake_word` variable. Branch on it.
 
-```ts
-// tests/realtime/wsServer.test.ts — append
-it('interrupt cancels OpenAI response', async () => {
-  // ... similar setup to existing tests ...
-  ws.send(JSON.stringify({ type: 'interrupt' }));
-  await new Promise((r) => setTimeout(r, 50));
-  expect(mock.events.some((e) => e.type === 'response.cancel')).toBe(true);
-});
+- [ ] **Step 1: Read current chain**
+
+```bash
+cd /Users/mlepekha/Developer/home/home-assistant-voice-pe
+grep -n -A 30 "on_wake_word_detected:" home-assistant-voice.va-direct.yaml | head -50
 ```
 
-Run: `npm test`. Fix bridge if needed.
+- [ ] **Step 2: Add a `wake_word == "stop"` branch**
 
-- [ ] **Step 2: Wire "stop" wake word in yaml**
-
-In `home-assistant-voice.va-direct.yaml`, locate the `micro_wake_word:` model entry for `stop.json`:
+Replace the existing `then` body with:
 
 ```yaml
-- model: stop
-  id: stop_word
-  on_wake_word_detected:
-    - lambda: id(va).send_interrupt();
-    - speaker.stop:
-        id: speaker_i2s
+on_wake_word_detected:
+  - if:
+      condition:
+        lambda: 'return wake_word == "stop";'
+      then:
+        # The "stop" word is only armed during reply; it cancels the
+        # in-flight turn server-side and flushes our local audio queue.
+        - lambda: 'id(va)->send_interrupt();'
+      else:
+        # The previous full cascade (timer check, mute check, wake-sound,
+        # start_session). Keep it intact for okay_nabu / hey_jarvis /
+        # hey_mycroft.
+        - <existing cascade>
 ```
 
-- [ ] **Step 3: Manual smoke**
+The exact YAML structure depends on the current chain — wrap the
+existing body in the `else:` branch of the new `if`.
 
-Flash; trigger a long reply; say "stop"; expect audio to cut within ~300ms.
+- [ ] **Step 3: Verify "stop" only fires during reply**
 
-- [ ] **Step 4: Commit**
+In yaml, "stop" is configured as `internal: true` and we want it armed
+only while `phase=replying`. The existing `activate_stop_word_once`
+script does this on `media_player.is_announcing` — but our TTS doesn't
+go through media_player. Wire it differently:
+
+  - On the va_client `on_phase` trigger, when `phase == "replying"`:
+    `micro_wake_word.enable_model: stop`
+  - When `phase == "idle"`: `micro_wake_word.disable_model: stop`
+
+Update the `va_client.on_phase` yaml block to add these.
+
+- [ ] **Step 4: Implement audio queue flush in `send_interrupt`**
+
+In `va_client.cpp`, `send_interrupt()` currently only sends the WS text
+message. Also flush our PSRAM audio queue so playback stops immediately:
+
+```cpp
+void VaClient::send_interrupt() {
+  if (!this->ws_connected_ || this->ws_handle_ == nullptr) {
+    ESP_LOGW(TAG, "send_interrupt: WS not connected");
+    return;
+  }
+  const char msg[] = "{\"type\":\"interrupt\"}";
+  auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
+  esp_websocket_client_send_text(handle, msg, sizeof(msg) - 1, portMAX_DELAY);
+  // Drop everything in the playback queue. The speaker's own ring will
+  // play out its ~500 ms residual, but that's fine — interrupt UX
+  // expects "stop talking", not "absolute silence right now".
+  this->audio_head_ = this->audio_tail_ = 0;
+  this->audio_fill_ = 0;
+  ESP_LOGI(TAG, "send_interrupt — WS msg sent, queue flushed");
+}
+```
+
+- [ ] **Step 5: Manual test**
+
+Flash, say "okay nabu, tell me a long story". When AI starts replying,
+say "stop". Expected:
+- Within ~300 ms, audio stops (modulo the ~500 ms speaker tail).
+- LED returns to idle (with proper drain-deferred timing).
+- No new session starts — wake word doesn't ding.
+
+- [ ] **Step 6: Commit**
 
 ```bash
-cd voice-assistant && git add tests/realtime/wsServer.test.ts && git commit -m "test(realtime): interrupt cancels response"
-cd ../home-assistant-voice-pe && git add home-assistant-voice.va-direct.yaml && git commit -m "feat(firmware): wire stop wake word to interrupt"
+git add esphome/components/va_client/va_client.cpp \
+        home-assistant-voice.va-direct.yaml
+git commit -m "feat(va_client): stop wake-word as interrupt + audio queue flush"
 ```
 
-## Task M3.4: Reconnect with backoff + error.flac
+## Task M3.2: Verify XMOS AEC so the mic doesn't hear the speaker
+
+**Files:**
+- Likely none; this is a debugging / configuration task. If we find
+  the XMOS reference path isn't wired correctly, edit `voice_kit:` or
+  `i2s_audio:` blocks in `home-assistant-voice.va-direct.yaml`.
+
+The Voice PE's XMOS DSP runs AEC against a reference signal taken from
+the I2S output bus. With the original `voice_assistant` + `media_player`
+chain, that was straightforward. After we ripped out media_player and
+rebuilt the speaker chain, it's worth verifying the AEC reference path
+still works.
+
+- [ ] **Step 1: Test setup**
+
+With the device fully booted and idle:
+1. Open serial logs.
+2. Play loud TTS (say "okay nabu, count from one to ten slowly").
+3. While AI is replying, stay silent and don't move.
+
+- [ ] **Step 2: Check for spurious VAD events**
+
+In va's docker logs (`docker logs voice-assistant --tail=100`),
+look for events arriving DURING the reply:
+- `input_audio_buffer.speech_started` while the device is supposed to
+  be replying = mic picked up the speaker → AEC isn't working.
+
+If clean → AEC works, skip the rest of this task. Mark done.
+
+- [ ] **Step 3: If AEC failing, inspect**
+
+Likely fixes:
+- Confirm `voice_kit.pipeline_stages` config matches the original yaml.
+- Check XMOS firmware version (`voice_kit:045: XMOS firmware version`
+  log line) is `1.3.1`.
+- The reference path may need explicit i2s loopback config in the
+  yaml — compare with `home-assistant-voice.yaml` original.
+
+- [ ] **Step 4: Document findings**
+
+Append findings to the spec's "Open questions" or risks section.
+
+## Task M3.3: On-device latency metrics
 
 **Files:**
 - Modify: `esphome/components/va_client/va_client.cpp`
-- Modify: `home-assistant-voice.va-direct.yaml`
 
-- [ ] **Step 1: Implement backoff in `schedule_reconnect_`**
+va_client already logs many state transitions. Add a per-turn summary
+log so we can read latency without correlating timestamps by hand.
+
+- [ ] **Step 1: Add per-turn timestamps**
+
+In `va_client.h`, add fields for the four anchor moments of a turn:
 
 ```cpp
-void VaClient::on_ws_close_(int) {
-  set_phase_(Phase::Idle);
-  // exponential backoff capped at 10s
-  this->set_timeout(reconnect_delay_ms_, [this]() {
-    this->connect_();
-  });
-  reconnect_delay_ms_ = std::min<uint32_t>(reconnect_delay_ms_ * 2, 10000);
-}
-
-void VaClient::on_ws_open_() {
-  reconnect_delay_ms_ = 1000;  // reset on success
-  // ...
-}
+uint32_t turn_t_wake_{0};
+uint32_t turn_t_listening_{0};
+uint32_t turn_t_thinking_{0};
+uint32_t turn_t_first_audio_out_{0};
 ```
 
-- [ ] **Step 2: Error sound on hard failure**
+In `va_client.cpp`:
+- `start_session()` → `turn_t_wake_ = millis(); reset others to 0;`
+- `set_phase_("listening")` (first time after start_session) →
+  `turn_t_listening_ = millis();`
+- `set_phase_("thinking")` → `turn_t_thinking_ = millis();`
+- `handle_binary_()` first call after `turn_t_thinking_` → record
+  `turn_t_first_audio_out_ = millis();`
+- `set_phase_("idle")` (the deferred fire, after drain) → log the
+  summary:
 
-In yaml, add a script that plays `sounds/error.flac` when 3 consecutive reconnects fail. Expose a counter from the component and a trigger `on_repeated_failure` via the standard ESPHome automation pattern, OR (simpler) toggle a red-X LED only and skip the audio in M3.
+```cpp
+ESP_LOGI(TAG, "turn timings: wake→listening=%ums listening→thinking=%ums "
+              "thinking→first_audio=%ums first_audio→done=%ums",
+         turn_t_listening_ - turn_t_wake_,
+         turn_t_thinking_ - turn_t_listening_,
+         turn_t_first_audio_out_ - turn_t_thinking_,
+         millis() - turn_t_first_audio_out_);
+```
 
-For M3, keep it simple: red-X LED via existing error-state LED action.
+- [ ] **Step 2: Manual test**
 
-- [ ] **Step 3: Manual smoke**
+Run a few representative utterances:
+- "what time is it" (no tool call)
+- "turn on the kitchen light" (one MCP call)
+- "tell me a joke" (longer reply)
 
-Stop the `voice-assistant` container on the Pi. Trigger wake word. Expect red-X LED. Restart va. Expect device reconnects within ≤ 10s and the next wake word works.
+Read the summary lines. Record three baseline numbers in the spec under
+a new "Performance" section.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
-git add esphome/components/va_client/va_client.cpp home-assistant-voice.va-direct.yaml
-git commit -m "feat(va_client): exponential reconnect backoff + error LED"
+git add esphome/components/va_client/
+git commit -m "feat(va_client): per-turn latency summary log"
 ```
+
+## Task M3.4: Audible error when va is unreachable
+
+**Files:**
+- Modify: `esphome/components/va_client/va_client.cpp` (or)
+- Modify: `home-assistant-voice.va-direct.yaml`
+
+Right now if the WS to va fails, the LED goes to red twinkle (via
+`control_leds_no_ha_connection_state`) and the user sees nothing else
+useful. The original behaviour played `error_cloud_expired.mp3` via
+`play_sound` on cloud-auth failure. Replicate that for va connection
+failure.
+
+- [ ] **Step 1: Decide trigger**
+
+After N consecutive reconnect failures (e.g. 5 → ~10 minutes of
+backoff), play the error sound exactly once. Reset the counter on
+successful connect.
+
+- [ ] **Step 2: Add a `on_repeated_failure` automation hook**
+
+In `va_client/__init__.py`, add a new automation trigger:
+`OnRepeatedFailureTrigger`. In `va_client.cpp`, increment a counter on
+each reconnect failure; on counter == 5, fire the trigger.
+
+- [ ] **Step 3: Wire into yaml**
+
+```yaml
+va_client:
+  ...
+  on_repeated_failure:
+    - script.execute:
+        id: play_sound
+        priority: true
+        sound_file: "error_cloud_expired_sound"
+```
+
+- [ ] **Step 4: Manual test**
+
+Stop va docker container on the Pi. Wait until 5 reconnect attempts have
+elapsed. Verify error chime plays once, not on every failure.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add esphome/components/va_client/ home-assistant-voice.va-direct.yaml
+git commit -m "feat(va_client): audible error on repeated connection failure"
+```
+
+## Task M3.5: Stability soak
+
+Run an unattended soak test:
+- Leave device idle for 30 minutes; confirm no WS drops, no spurious
+  wake-word triggers.
+- Have a normal conversation (5+ turns) every 5 minutes for ~30 min.
+- Inspect free heap (`debug:` component logs it) trend over the run —
+  should NOT grow.
+
+No code changes expected; goal is to catch any leak or pathological
+case before declaring M3 done.
+
+## Done before M3 started
+
+These items appeared in earlier drafts of the M3 plan. They landed
+during M2 stabilisation already, listed here so we don't redo them:
+
+- Reconnect with exponential backoff and reset-on-open
+  (`fix(va_client): coalesce reconnect on cascading WS event burst`).
+- Follow-up dialog window (5 s) after AI reply with drain timing
+  (`fix(va_client): add follow-up dialog window with proper drain timing`).
+- LED idle transition deferred until speaker actually drained
+  (`feat(va_client): defer LED idle transition until speaker actually drained`).
+- WS continuation frame handling.
+- PSRAM audio queue + draining via `speaker.play()` from `loop()`.
+- Per-phase mic streaming gate to prevent self-listening.
 
 ---
 
