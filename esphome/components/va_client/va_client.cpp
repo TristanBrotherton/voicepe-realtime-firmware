@@ -304,6 +304,36 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
     if (len == 0)
       return;
   }
+  // Apply a small software gain before writing to the ring. OpenAI Realtime
+  // TTS peaks around -3..-6 dBFS, which sounds noticeably quieter than the
+  // upstream HA TTS engines (which sit near 0 dBFS). We multiply by
+  // kTtsGainNumerator / kTtsGainDenominator with saturation. Keep the gain
+  // modest — clipping a 16 kHz speech signal is audible as a buzzy rasp.
+  // Tune by ear; bump kTtsGainNumerator if still too quiet.
+  size_t pairs = len / 2;
+  if (pairs > 0) {
+    auto *in = reinterpret_cast<const int16_t *>(data);
+    // Reuse mono_buf_ as a scratch — it's already int16_t.
+    this->mono_buf_.resize(pairs);
+    // Combine the +3.5 dB gain (compensates OpenAI's -3..-6 dBFS output)
+    // with the user-controlled volume coming from external_media_player.
+    // volume_ is set from yaml on every media_player volume / mute change.
+    float vol = this->volume_;
+    if (vol < 0.0f) vol = 0.0f;
+    else if (vol > 1.0f) vol = 1.0f;
+    // Scale factor in fixed-point Q15 so we stay int-only in the inner loop.
+    int32_t scale = static_cast<int32_t>(
+        vol * (32768.0f * kTtsGainNumerator / kTtsGainDenominator));
+    for (size_t i = 0; i < pairs; i++) {
+      int32_t v = (static_cast<int32_t>(in[i]) * scale) >> 15;
+      if (v > 32767) v = 32767;
+      else if (v < -32768) v = -32768;
+      this->mono_buf_[i] = static_cast<int16_t>(v);
+    }
+    data = reinterpret_cast<const uint8_t *>(this->mono_buf_.data());
+    // len is unchanged (pairs * 2 == len rounded down; trailing odd byte ignored).
+    len = pairs * 2;
+  }
   // Two-part write: from tail to end, then wrap to start.
   size_t first = std::min(len, kAudioBufBytes - this->audio_tail_);
   std::memcpy(this->audio_buf_ + this->audio_tail_, data, first);

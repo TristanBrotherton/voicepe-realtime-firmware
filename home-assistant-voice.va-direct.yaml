@@ -54,6 +54,12 @@ esphome:
       # to no_ha_connection (red twinkle) until both wifi and va_client WS
       # come up — then it falls through to the idle phase naturally.
       - lambda: id(init_in_progress) = false;
+      # Seed va_client with the restored media_player volume so the first
+      # TTS reply respects the user's volume setting instead of blasting
+      # at 100% until they touch the +/- buttons.
+      - lambda: |-
+          id(va).set_volume(id(external_media_player).is_muted() ? 0.0f
+                                                                 : id(external_media_player).volume);
       - micro_wake_word.start:
       - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
       - script.execute: control_leds
@@ -1602,6 +1608,21 @@ media_player:
     volume_increment: 0.05
     volume_min: 0.4
     volume_max: 0.85
+    # Mirror the media_player volume / mute state into va_client so the
+    # device's physical +/- buttons and mute switch scale our TTS output.
+    # (No api: block on this firmware — there's no HA-side slider, the
+    # media_player exists only inside ESPHome.) Without this hook va_client
+    # writes into media_resampling_speaker bypassing the media_player, so
+    # the volume control would only affect chime announcements (wake /
+    # mute / error) — not the assistant's voice.
+    on_volume:
+      - lambda: |-
+          id(va).set_volume(id(external_media_player).is_muted() ? 0.0f
+                                                                 : id(external_media_player).volume);
+    on_mute:
+      - lambda: 'id(va).set_volume(0.0f);'
+    on_unmute:
+      - lambda: 'id(va).set_volume(id(external_media_player).volume);'
 
 sendspin:
   id: sendspin_hub
@@ -1693,11 +1714,12 @@ va_client:
   token: !secret va_device_token
   microphone: i2s_mics
   mic_channel: 0
-  # Write raw PCM16 mono 24kHz into the media resampler. We use this lane
-  # (not announcement_resampling_speaker) because external_media_player
-  # is wired to the announcement pipeline and would treat each speaker.play()
-  # as a fresh announcement, cutting our previous chunk short. The media
-  # lane is otherwise unused (no music_pipeline configured).
+  # Write raw PCM16 mono 24kHz into the media resampler. We can't share the
+  # announcement lane with external_media_player — va_client grabs the
+  # resampling speaker on setup and holds it, which prevents the upstream
+  # wake-chime / mute / error sounds (all played via media_player as
+  # announcements) from reaching the i2s output. The media lane is otherwise
+  # unused (no music pipeline configured), so it's effectively ours.
   speaker: media_resampling_speaker
   on_phase:
     - lambda: |-

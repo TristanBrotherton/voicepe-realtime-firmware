@@ -21,6 +21,13 @@ class VaClient : public Component {
   void set_microphone(microphone::Microphone *m) { mic_ = m; }
   void set_mic_channel(uint8_t c) { mic_channel_ = c; }
   void set_speaker(speaker::Speaker *s) { speaker_ = s; }
+  // Sets the output-volume multiplier applied to TTS in handle_binary_.
+  // Driven from yaml by external_media_player's volume / mute state so the
+  // device's physical +/- buttons and mute switch scale our TTS the same
+  // way they scale chime announcements played through media_player. (No
+  // HA api: block on this firmware — there's no remote slider.) Range
+  // [0, 1]; values are clamped on read so callers don't have to bounds-check.
+  void set_volume(float v) { volume_ = v; }
   void add_on_phase_trigger(OnPhaseTrigger *t) { phase_triggers_.push_back(t); }
   void add_on_repeated_failure_trigger(OnRepeatedFailureTrigger *t) {
     repeated_failure_triggers_.push_back(t);
@@ -139,6 +146,21 @@ class VaClient : public Component {
   // Tracks the opcode of the in-flight WS message so we can route
   // continuation frames (op_code = 0) to the same handler.
   bool last_data_was_binary_{false};
+
+  // Software TTS gain applied in handle_binary_ before queueing audio.
+  // OpenAI Realtime output peaks around -3..-6 dBFS — perceptibly quieter
+  // than the upstream HA TTS engines which sit near 0 dBFS. 2/1 = +6 dB
+  // is loud enough to match the upstream feel and still has headroom
+  // because volume_max in the media_player block caps us at 0.85.
+  // Raise the numerator carefully — speech that clips sounds buzzy, not
+  // just loud.
+  static constexpr int32_t kTtsGainNumerator = 2;
+  static constexpr int32_t kTtsGainDenominator = 1;
+
+  // Output volume multiplier in [0, 1], updated from yaml whenever
+  // external_media_player.volume / mute changes. Defaults to 1.0 so a
+  // stand-alone va_client (no media_player wiring) still plays audibly.
+  float volume_{1.0f};
 
   // Ring buffer for pending TTS audio, allocated in PSRAM. The server can
   // burst the entire response in ~200 ms; we buffer here and drain into
