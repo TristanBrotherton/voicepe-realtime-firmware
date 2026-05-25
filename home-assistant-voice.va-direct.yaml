@@ -1656,7 +1656,16 @@ external_components:
   - source:
       type: local
       path: esphome/components
-    components: [va_client]
+    components: [va_client, udp_log]
+
+# va-direct: forward device logs to a UDP sink container on the Pi so they
+# show up in Dozzle alongside the rest of the stack. See voice-pe-logs in
+# home-infra/docker-compose.yml. Skip if the sink isn't running — sendto()
+# fails silently and the device keeps running.
+udp_log:
+  host: va.local
+  port: 5140
+  level: INFO
 
 va_client:
   id: va
