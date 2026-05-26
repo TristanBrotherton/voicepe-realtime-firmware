@@ -1496,6 +1496,30 @@ script:
   # on_phase handler (enable on phase=replying, disable otherwise).
   # Kept for diff readability with upstream; safe to delete once the
   # va-direct yaml is the only one.
+  # Watchdog for va_client follow-up windows: if the user stays silent
+  # during a request_follow_up window, va_client closes the mic at
+  # kRequestFollowUpMs (10 s) but doesn't notify yaml. Without this script
+  # the LED would stay in listening_for_command forever and the `stop`
+  # model would never disarm. mode: restart so a new follow-up cancels
+  # the previous timer.
+  #
+  # Total wait = kFollowupOpenDelayMs (1500ms drain wait before mic opens)
+  # + kRequestFollowUpMs (10000ms mic-open window) + 500ms buffer.
+  - id: followup_window_watchdog
+    mode: restart
+    then:
+      - delay: 12000ms
+      # If we're still in listening (user never spoke / server never moved
+      # past listening_for_command), the follow-up timed out silently.
+      # Disarm stop and drop the LED back to idle.
+      - if:
+          condition:
+            lambda: 'return id(voice_assistant_phase) == ${voice_assist_listening_for_command_phase_id};'
+          then:
+            - micro_wake_word.disable_model: stop
+            - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+            - script.execute: control_leds
+
   - id: activate_stop_word_once
     then:
       - wait_until:
@@ -1772,6 +1796,15 @@ va_client:
               sound_file: "wake_word_triggered_sound"
     - lambda: id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
     - script.execute: control_leds
+    # Arm the "stop" wake word so the user can abort if they changed
+    # their mind ("отмени"/"stop"). on_phase only enables stop during
+    # replying — during follow-up listening the server is silent until
+    # the user speaks, so we have to enable it ourselves.
+    - micro_wake_word.enable_model: stop
+    # If the user stays silent, va_client closes the mic at kRequestFollowUpMs
+    # but doesn't notify yaml — without this watchdog the LED would stay
+    # in listening_for_command forever and `stop` would never disarm.
+    - script.execute: followup_window_watchdog
 
 audio_dac:
   - platform: aic3204
@@ -1809,55 +1842,79 @@ micro_wake_word:
               then:
                 - switch.turn_off: timer_ringing
               else:
-                # Branch on the assistant's current phase, mirroring the
-                # original yaml's `voice_assistant.is_running` check. Any
-                # wake word fired while we're actively replying = interrupt
-                # request, regardless of which model triggered. Idle/listening/
-                # thinking → fresh session.
+                # The "stop" model is special — it's a cancel signal, not a
+                # session-start. We want it to work in any non-idle phase:
+                # during replying (current barge-in), but also during the
+                # follow-up listening window (user changed their mind) and
+                # while server VAD has us in listening/thinking (user wants
+                # to abort their own utterance). mww reports the wake word
+                # label, which has been observed as "Stop" (capital) on
+                # this model — check both forms case-defensively.
                 - if:
                     condition:
-                      lambda: 'return id(voice_assistant_phase) == ${voice_assist_replying_phase_id};'
+                      lambda: 'return wake_word == "Stop" || wake_word == "stop";'
                     then:
-                      # Interrupt the active reply. Flush the queue + stop
-                      # the resampler so audio cuts immediately. No wake
-                      # chime — user is barging in, not starting fresh.
-                      - lambda: 'id(va)->send_interrupt();'
-                      - speaker.stop:
-                          id: media_resampling_speaker
-                      - lambda: id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
-                      - script.execute: control_leds
-                    else:
-                      # Regular wake word: play wake chime, start a new session.
+                      # Cancel anything in flight (reply, follow-up listening,
+                      # user STT). send_interrupt() flushes the audio queue and
+                      # tells the server to drop the response. No-op in idle.
                       - if:
                           condition:
-                            switch.is_on: wake_sound
+                            lambda: 'return id(voice_assistant_phase) != ${voice_assist_idle_phase_id};'
                           then:
-                            - script.execute:
-                                id: play_sound
-                                priority: true
-                                sound_file: "wake_word_triggered_sound"
-                            # Wait until the chime has actually finished
-                            # playing through the speaker — a fixed 300ms
-                            # delay was racing with the ~500ms FLAC and the
-                            # mic was streaming the chime tail to OpenAI
-                            # (which transcribed it as "Ok, nabór").
-                            - wait_until:
+                            - lambda: 'id(va)->send_interrupt();'
+                            - speaker.stop:
+                                id: media_resampling_speaker
+                            - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+                            - script.execute: control_leds
+                            - micro_wake_word.disable_model: stop
+                    else:
+                      # Non-stop wake word: branch on the assistant's current
+                      # phase. Wake fired while replying = barge-in (interrupt
+                      # the reply); idle/listening/thinking → fresh session.
+                      - if:
+                          condition:
+                            lambda: 'return id(voice_assistant_phase) == ${voice_assist_replying_phase_id};'
+                          then:
+                            # Interrupt the active reply. Flush the queue +
+                            # stop the resampler so audio cuts immediately. No
+                            # wake chime — user is barging in, not starting fresh.
+                            - lambda: 'id(va)->send_interrupt();'
+                            - speaker.stop:
+                                id: media_resampling_speaker
+                            - lambda: id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
+                            - script.execute: control_leds
+                          else:
+                            # Regular wake word: play wake chime, start a new session.
+                            - if:
                                 condition:
-                                  not:
-                                    media_player.is_announcing:
-                                      id: external_media_player
-                                timeout: 2s
-                            # Plus the downstream speaker ring buffer is
-                            # still ~600ms behind — wait a bit more so the
-                            # mic only catches the user's actual command.
-                            - delay: 600ms
-                      - lambda: 'id(va)->start_session();'
-                      # Show "waiting for command" (blue spin) immediately on wake,
-                      # before the server VAD detects actual speech. va_client's
-                      # on_phase will overwrite to phase 3 (listening_for_command)
-                      # once the server reports speech started.
-                      - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
-                      - script.execute: control_leds
+                                  switch.is_on: wake_sound
+                                then:
+                                  - script.execute:
+                                      id: play_sound
+                                      priority: true
+                                      sound_file: "wake_word_triggered_sound"
+                                  # Wait until the chime has actually finished
+                                  # playing through the speaker — a fixed 300ms
+                                  # delay was racing with the ~500ms FLAC and the
+                                  # mic was streaming the chime tail to OpenAI
+                                  # (which transcribed it as "Ok, nabór").
+                                  - wait_until:
+                                      condition:
+                                        not:
+                                          media_player.is_announcing:
+                                            id: external_media_player
+                                      timeout: 2s
+                                  # Plus the downstream speaker ring buffer is
+                                  # still ~600ms behind — wait a bit more so the
+                                  # mic only catches the user's actual command.
+                                  - delay: 600ms
+                            - lambda: 'id(va)->start_session();'
+                            # Show "waiting for command" (blue spin) immediately on wake,
+                            # before the server VAD detects actual speech. va_client's
+                            # on_phase will overwrite to phase 3 (listening_for_command)
+                            # once the server reports speech started.
+                            - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
+                            - script.execute: control_leds
 
 select:
   - platform: template
