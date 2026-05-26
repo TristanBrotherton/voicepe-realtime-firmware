@@ -233,6 +233,32 @@ class VaClient : public Component {
   uint32_t turn_t_listening_{0};          // server's first phase=listening
   uint32_t turn_t_thinking_{0};           // server's phase=thinking (end-of-speech)
   uint32_t turn_t_first_audio_out_{0};    // first binary chunk arrived from server
+
+  // Diagnostics for the "speech sometimes drops into hiss / noise"
+  // symptom. We don't know the cause yet, so we measure three things
+  // simultaneously and let the logs tell us which one (if any) fires
+  // during a bad reply.
+  //
+  //  1) WS frame inter-arrival time. If the bridge stalls and audio
+  //     arrives in bursts with > kWsGapWarnMs silence between, the
+  //     downstream chain may underrun and inject silence/noise. We log
+  //     each large gap with the duration and how full the PSRAM ring
+  //     was at the time.
+  //  2) TTS clipping. With kTtsGainNumerator/Denominator = 2/1 we add
+  //     +6 dB before queueing. If model audio peaks high enough to
+  //     saturate, the result is a buzzy distortion. We count clipped
+  //     samples per chunk and warn at the per-turn summary if any
+  //     turn had clipping.
+  //  3) Downstream underrun. speaker_->has_buffered_data() = false
+  //     while audio_fill_ > 0 means the resampler/mixer/i2s chain ran
+  //     dry while we still had PSRAM to feed it — bug or stall in the
+  //     downstream side. We log the first underrun per reply.
+  uint32_t last_binary_ms_{0};
+  uint32_t ws_gap_count_{0};       // # gaps > kWsGapWarnMs in this turn
+  uint32_t ws_gap_max_ms_{0};      // largest gap observed this turn
+  uint32_t clipped_samples_{0};    // clipped samples in this turn
+  bool underrun_logged_this_turn_{false};
+  static constexpr uint32_t kWsGapWarnMs = 80;  // > ~3× normal 20 ms frame
 };
 
 }  // namespace va_client

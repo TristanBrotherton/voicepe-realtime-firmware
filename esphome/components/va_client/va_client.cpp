@@ -69,6 +69,16 @@ void VaClient::loop() {
     size_t fill = this->audio_fill_;
     portEXIT_CRITICAL(&this->ring_mux_);
     if (fill > 0) {
+      // Detector 3: downstream underrun. If the resampler/mixer/i2s chain
+      // ran out of bytes to play while we *still* have PSRAM queued,
+      // something hiccupped downstream — the user hears silence or a
+      // brief stuck-sample glitch. Log the first occurrence per reply so
+      // we know whether bad audio in a turn correlates with this.
+      if (!this->underrun_logged_this_turn_ && !this->speaker_->has_buffered_data()) {
+        ESP_LOGW(TAG, "downstream underrun: %u bytes queued in PSRAM but speaker chain is dry",
+                 (unsigned) fill);
+        this->underrun_logged_this_turn_ = true;
+      }
       // Contiguous slice we can hand to play() without copying: from head
       // to either the end of the buffer or the tail.
       size_t contiguous = (head < tail) ? (tail - head) : (kAudioBufBytes - head);
@@ -359,9 +369,25 @@ void VaClient::handle_text_(const char *data, size_t len) {
 void VaClient::handle_binary_(const uint8_t *data, size_t len) {
   if (this->speaker_ == nullptr || len < 2 || this->audio_buf_ == nullptr)
     return;
+  const uint32_t now_ms = millis();
   if (this->turn_t_first_audio_out_ == 0 && this->turn_t_wake_ != 0) {
-    this->turn_t_first_audio_out_ = millis();
+    this->turn_t_first_audio_out_ = now_ms;
   }
+  // Detector 1: WS frame inter-arrival jitter. Normal cadence is ~20 ms
+  // per frame (OpenAI streams realtime). A gap > kWsGapWarnMs means the
+  // bridge stalled, network blip, or OpenAI burst late — anything that
+  // could starve the downstream chain. Log immediately so the gap is
+  // adjacent to whatever the user reports hearing.
+  if (this->last_binary_ms_ != 0) {
+    const uint32_t gap = now_ms - this->last_binary_ms_;
+    if (gap > kWsGapWarnMs) {
+      this->ws_gap_count_++;
+      if (gap > this->ws_gap_max_ms_) this->ws_gap_max_ms_ = gap;
+      ESP_LOGW(TAG, "ws audio gap: %u ms (ring fill %u bytes)",
+               (unsigned) gap, (unsigned) this->audio_fill_);
+    }
+  }
+  this->last_binary_ms_ = now_ms;
   // PCM16 mono @ 24 kHz, append to ring buffer. loop() drains.
   // Snapshot audio_fill_ under the lock — it's modified by loop() on the
   // other core and we can't trust a torn read.
@@ -396,12 +422,14 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
     // Scale factor in fixed-point Q15 so we stay int-only in the inner loop.
     int32_t scale = static_cast<int32_t>(
         vol * (32768.0f * kTtsGainNumerator / kTtsGainDenominator));
+    uint32_t clipped = 0;
     for (size_t i = 0; i < pairs; i++) {
       int32_t v = (static_cast<int32_t>(in[i]) * scale) >> 15;
-      if (v > 32767) v = 32767;
-      else if (v < -32768) v = -32768;
+      if (v > 32767) { v = 32767; clipped++; }
+      else if (v < -32768) { v = -32768; clipped++; }
       this->mono_buf_[i] = static_cast<int16_t>(v);
     }
+    this->clipped_samples_ += clipped;
     data = reinterpret_cast<const uint8_t *>(this->mono_buf_.data());
     // len is unchanged (pairs * 2 == len rounded down; trailing odd byte ignored).
     len = pairs * 2;
@@ -592,6 +620,12 @@ void VaClient::start_session() {
   this->turn_t_listening_ = 0;
   this->turn_t_thinking_ = 0;
   this->turn_t_first_audio_out_ = 0;
+  // Reset audio-quality detectors for this turn.
+  this->last_binary_ms_ = 0;
+  this->ws_gap_count_ = 0;
+  this->ws_gap_max_ms_ = 0;
+  this->clipped_samples_ = 0;
+  this->underrun_logged_this_turn_ = false;
   // Watchdog: if server doesn't hear us within kNoSpeechTimeoutMs, abort the
   // session so we're not stuck with the mic open after a misfire.
   this->set_timeout("va_no_speech", kNoSpeechTimeoutMs, [this]() {
@@ -642,6 +676,17 @@ void VaClient::open_followup_window_(uint32_t duration_ms) {
                fmt(this->turn_t_thinking_, this->turn_t_first_audio_out_).c_str(),
                fmt(this->turn_t_first_audio_out_, now).c_str(),
                fmt(this->turn_t_wake_, now).c_str());
+      // Audio-quality summary: only logged if anything anomalous fired.
+      // A clean turn produces no line — keeps the noise floor low.
+      if (this->ws_gap_count_ > 0 || this->clipped_samples_ > 0 ||
+          this->underrun_logged_this_turn_) {
+        ESP_LOGW(TAG,
+                 "turn audio: ws_gaps=%u (max=%ums) clipped_samples=%u underrun=%s",
+                 (unsigned) this->ws_gap_count_,
+                 (unsigned) this->ws_gap_max_ms_,
+                 (unsigned) this->clipped_samples_,
+                 this->underrun_logged_this_turn_ ? "yes" : "no");
+      }
       this->turn_t_wake_ = 0;  // mark turn as logged
     }
   }
