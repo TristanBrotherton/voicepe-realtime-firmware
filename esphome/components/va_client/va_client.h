@@ -184,18 +184,6 @@ class VaClient : public Component {
   // continuation frames (op_code = 0) to the same handler.
   bool last_data_was_binary_{false};
 
-  // Software TTS gain applied in handle_binary_ before queueing audio.
-  // Disabled (1/1, unity gain) because the previous +6 dB value was
-  // clipping loud syllables — instrumented turns showed thousands of
-  // saturated samples per reply on long phrases, audibly buzzy/hissy.
-  // OpenAI Realtime output peaks around -3 dBFS which is plenty for
-  // the speaker chain; the DAC + amp provide more than enough gain
-  // headroom (media_player volume_max caps at 0.85, well below clip).
-  // If we ever need it back, do it as a soft-knee compressor instead
-  // of a hard multiplier so loud samples don't slam into int16 walls.
-  static constexpr int32_t kTtsGainNumerator = 1;
-  static constexpr int32_t kTtsGainDenominator = 1;
-
   // Output volume multiplier in [0, 1], updated from yaml whenever
   // external_media_player.volume / mute changes. Defaults to 1.0 so a
   // stand-alone va_client (no media_player wiring) still plays audibly.
@@ -246,11 +234,10 @@ class VaClient : public Component {
   //     downstream chain may underrun and inject silence/noise. We log
   //     each large gap with the duration and how full the PSRAM ring
   //     was at the time.
-  //  2) TTS clipping. With kTtsGainNumerator/Denominator = 2/1 we add
-  //     +6 dB before queueing. If model audio peaks high enough to
-  //     saturate, the result is a buzzy distortion. We count clipped
-  //     samples per chunk and warn at the per-turn summary if any
-  //     turn had clipping.
+  //  2) TTS clipping. Software gain is disabled, so clipping is
+  //     mathematically impossible while volume_ ≤ 1. Counter stays as
+  //     a tripwire — if anyone reintroduces a >1 scale factor, the
+  //     per-turn summary will surface it before users hear the rasp.
   //  3) Downstream underrun. speaker_->has_buffered_data() = false
   //     while audio_fill_ > 0 means the resampler/mixer/i2s chain ran
   //     dry while we still had PSRAM to feed it — bug or stall in the
