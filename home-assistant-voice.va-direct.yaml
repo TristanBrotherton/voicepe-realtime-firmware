@@ -1915,11 +1915,41 @@ micro_wake_word:
                             lambda: 'return id(voice_assistant_phase) == ${voice_assist_replying_phase_id};'
                           then:
                             # Interrupt the active reply. Flush the queue +
-                            # stop the resampler so audio cuts immediately. No
-                            # wake chime — user is barging in, not starting fresh.
+                            # stop the resampler so audio cuts immediately.
                             - lambda: 'id(va)->send_interrupt();'
                             - speaker.stop:
                                 id: media_resampling_speaker
+                            # Play the same wake chime as fresh-session so the
+                            # user gets an audible cue that the mic actually
+                            # reopened — without it the device just silences
+                            # mid-reply and the user can't tell whether they
+                            # need to repeat themselves. Skipped when the
+                            # wake_sound switch is off.
+                            - if:
+                                condition:
+                                  switch.is_on: wake_sound
+                                then:
+                                  - script.execute:
+                                      id: play_sound
+                                      priority: true
+                                      sound_file: "wake_word_triggered_sound"
+                                  - wait_until:
+                                      condition:
+                                        not:
+                                          media_player.is_announcing:
+                                            id: external_media_player
+                                      timeout: 2s
+                                  # Downstream ring tail — keep the chime
+                                  # off the mic so XMOS AEC doesn't leak it
+                                  # back as "Ok, nabu" into the new turn.
+                                  - delay: 400ms
+                            # Open the mic locally. Used to rely on the
+                            # bridge echoing phase=listening after interrupt;
+                            # bridge no longer does that (it would also pop
+                            # the mic open after a Stop), so we drive it
+                            # explicitly here. start_session() is idempotent
+                            # against the send_interrupt() above.
+                            - lambda: 'id(va)->start_session();'
                             - lambda: id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
                             - script.execute: control_leds
                           else:
