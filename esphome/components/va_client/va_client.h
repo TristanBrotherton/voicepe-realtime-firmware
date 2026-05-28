@@ -25,6 +25,15 @@ class VaClient : public Component {
   void set_microphone(microphone::Microphone *m) { mic_ = m; }
   void set_mic_channel(uint8_t c) { mic_channel_ = c; }
   void set_speaker(speaker::Speaker *s) { speaker_ = s; }
+  // Enables handsfree barge-in: when true the mic keeps streaming through the
+  // `thinking`/`replying` phases instead of being gated off, so the backend's
+  // server VAD can hear the user talk over the assistant. On the `listening`
+  // transition that follows (server confirmed a barge-in) we flush the PSRAM
+  // playback queue so the old TTS stops immediately. When false the firmware
+  // keeps the original turn-based behaviour (mic off while the assistant
+  // speaks). Relies on the XMOS AEC to suppress speaker→mic echo; see the
+  // ~10x leak caveat in CLAUDE.md.
+  void set_barge_in(bool v) { barge_in_ = v; }
   // Sets the output-volume multiplier applied to TTS in handle_binary_.
   // Driven from yaml by external_media_player's volume / mute state so the
   // device's physical +/- buttons and mute switch scale our TTS the same
@@ -112,6 +121,8 @@ class VaClient : public Component {
   //   - between wake-word start_session() and "listening"/"thinking"
   //   - and again after "idle" for kFollowupMs (in case AI asked a question)
   bool streaming_{false};
+  // Handsfree barge-in toggle, set from yaml (`barge_in:`). See set_barge_in().
+  bool barge_in_{true};
   // Set on phase=idle when there's still TTS audio queued — we can't open
   // the mic until the speaker drains, otherwise it picks up its own output.
   // loop() flips this to a live followup window once audio_fill_ hits 0.

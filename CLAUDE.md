@@ -115,21 +115,36 @@ or a sidecar HA integration.
 If the token mismatches, the device gets `401` on the WS upgrade and
 the failure counter trips after a few retries.
 
-## Critical caveat: XMOS AEC isn't perfect
+## Backend
 
-Measured on M3.2 hardware: ~10× speaker → mic leak survives AEC.
-That makes barge-in / follow-up-turn detection unreliable.
+This fork pairs with the **ha-openai-realtime** Home Assistant add-on
+(`xandervanerven/ha-openai-realtime`, a fork of `fjfricke/ha-openai-realtime`).
+The add-on terminates the device WebSocket, runs the OpenAI Realtime session
+(`gpt-realtime-2`), bridges Home Assistant control through the unofficial
+`homeassistant-ai/ha-mcp` MCP server, and emits the `phase` messages this
+firmware consumes. (The original `maxmaxme` `voice-assistant` Node backend is
+not public; the add-on speaks the same wire protocol.)
 
-For that reason **the follow-up dialog window is currently disabled**
-in `va_client.h`:
+## Handsfree barge-in (`barge_in:`)
 
-```cpp
-static constexpr uint32_t kFollowupMs = 0;
-```
+`va_client` now has a `barge_in` option (default `true`, wired in the
+va-direct yaml). When enabled, the mic keeps streaming through the
+`thinking`/`replying` phases instead of being gated off, so the backend's
+server VAD can hear the user talk over the assistant; the `listening`
+transition that follows flushes the PSRAM playback queue to stop the old TTS.
 
-Practical consequence: the user must say the wake word for each new
-turn. Once AEC improves (or we switch to a different DSP), bump
-`kFollowupMs` to reopen the mic automatically after `replying` ends.
+### Critical caveat: XMOS AEC isn't perfect
+
+Measured on M3.2 hardware: ~10× speaker → mic leak survives AEC, so handsfree
+barge-in is **best-effort** — echo can trip the server VAD and cut a reply
+short. The **"stop" word and the center button remain the reliable interrupt**.
+Raise `vad_threshold` in the add-on (and rely on the XMOS AEC) to reduce false
+barge-ins, or set `barge_in: false` for the original turn-based behaviour.
+
+The post-reply follow-up window is still gated by `kFollowupMs` in
+`va_client.h` (default `0` = mic closes after each reply; the user says a wake
+word for the next turn). Bump it to re-open the mic automatically once AEC is
+tuned.
 
 ## Building / flashing
 

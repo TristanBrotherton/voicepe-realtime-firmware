@@ -33,9 +33,15 @@ substitutions:
   easter_egg_tick_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/easter_egg_tick.mp3
   easter_egg_tada_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/easter_egg_tada.mp3
   error_cloud_expired_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/error_cloud_expired.mp3
-  # va-direct: voice-assistant WS endpoint on the Pi (mDNS resolves on LAN).
-  va_url: "ws://va.local:3001/voice"
-  # va_device_token must be defined in secrets.yaml (do NOT inline)
+  # WebSocket endpoint of the "OpenAI Realtime Voice Agent" Home Assistant
+  # add-on (this fork's backend). The add-on runs with host_network and
+  # listens on port 8080. homeassistant.local resolves via mDNS on the LAN;
+  # change this if your HA host has a different name/IP, e.g.
+  # "ws://192.168.1.10:8080/".
+  va_url: "ws://homeassistant.local:8080/"
+  # va_device_token must be defined in secrets.yaml (do NOT inline). The
+  # add-on does not enforce it today, so any non-empty string works; keep it
+  # for forward-compatibility with a future authenticated handshake.
 
 esphome:
   name: home-assistant-voice
@@ -1733,10 +1739,17 @@ external_components:
     components:
       - voice_kit
     refresh: 0s
+  # va_client (OpenAI-realtime thin client) + udp_log live in this fork. Pull
+  # them from GitHub so the config works as-is when pasted into the ESPHome
+  # Builder / dashboard without a local checkout. If you cloned the repo and
+  # want to iterate on the C++ locally, swap this back to:
+  #   - source: {type: local, path: esphome/components}
   - source:
-      type: local
-      path: esphome/components
+      type: git
+      url: https://github.com/xandervanerven/home-assistant-voice-pe
+      ref: dev
     components: [va_client, udp_log]
+    refresh: 0s
 
 # va-direct: forward device logs to a UDP sink container on the Pi so they
 # show up in Dozzle alongside the rest of the stack. See voice-pe-logs in
@@ -1764,6 +1777,12 @@ va_client:
   token: !secret va_device_token
   microphone: i2s_mics
   mic_channel: 0
+  # Handsfree barge-in: keep the mic open while the assistant is speaking so
+  # you can talk over it and the backend's server VAD will cut the reply off.
+  # Relies on the XMOS AEC to suppress speaker->mic echo (imperfect — see
+  # CLAUDE.md). Set to false for the original turn-based behaviour (mic closed
+  # while replying; interrupt only via the "stop" word or the center button).
+  barge_in: true
   # Write raw PCM16 mono 24kHz into the media resampler. We can't share the
   # announcement lane with external_media_player — va_client grabs the
   # resampling speaker on setup and holds it, which prevents the upstream

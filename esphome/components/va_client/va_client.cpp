@@ -511,6 +511,21 @@ void VaClient::set_phase_(const std::string &phase) {
       ESP_LOGI(TAG, "phase=listening — mic streaming on");
       this->streaming_ = true;
     }
+    // Handsfree barge-in cut-over: a `listening` arriving while we still have
+    // TTS queued means the backend's server VAD heard the user talk over the
+    // reply and already cancelled the OpenAI response. Drop the audio still in
+    // our PSRAM ring so playback stops immediately instead of finishing the
+    // now-cancelled sentence. We do NOT send a WS interrupt here — the backend
+    // initiated this — we just stop local playback.
+    if (this->barge_in_ && this->audio_fill_ > 0) {
+      portENTER_CRITICAL(&this->ring_mux_);
+      this->audio_head_ = 0;
+      this->audio_tail_ = 0;
+      this->audio_fill_ = 0;
+      portEXIT_CRITICAL(&this->ring_mux_);
+      this->idle_emit_pending_ = false;
+      ESP_LOGI(TAG, "phase=listening during reply — barge-in, flushed TTS queue");
+    }
     if (this->turn_t_listening_ == 0 && this->turn_t_wake_ != 0) {
       this->turn_t_listening_ = millis();
     }
@@ -518,7 +533,11 @@ void VaClient::set_phase_(const std::string &phase) {
     this->cancel_timeout("va_no_speech");
     this->cancel_timeout("va_followup");
   } else if (phase == "thinking" || phase == "replying") {
-    if (this->streaming_) {
+    // With handsfree barge-in the mic stays open through thinking/replying so
+    // the user can interrupt; the backend's server VAD + the XMOS AEC decide
+    // when that's a real barge-in. Without it, fall back to the original
+    // turn-based gate (mic off while the assistant is busy/speaking).
+    if (this->streaming_ && !this->barge_in_) {
       ESP_LOGI(TAG, "phase=%s — mic streaming off", phase.c_str());
       this->streaming_ = false;
     }

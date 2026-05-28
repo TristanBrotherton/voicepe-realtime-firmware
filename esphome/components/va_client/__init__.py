@@ -12,6 +12,7 @@ CONF_TOKEN = "token"
 CONF_MICROPHONE = "microphone"
 CONF_MIC_CHANNEL = "mic_channel"
 CONF_SPEAKER = "speaker"
+CONF_BARGE_IN = "barge_in"
 CONF_ON_PHASE = "on_phase"
 CONF_ON_REPEATED_FAILURE = "on_repeated_failure"
 CONF_ON_FOLLOWUP_OPENED = "on_followup_opened"
@@ -35,6 +36,7 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Required(CONF_TOKEN): cv.string,
         cv.Required(CONF_MICROPHONE): cv.use_id(microphone.Microphone),
         cv.Optional(CONF_MIC_CHANNEL, default=0): cv.int_range(min=0, max=1),
+        cv.Optional(CONF_BARGE_IN, default=True): cv.boolean,
         cv.Required(CONF_SPEAKER): cv.use_id(speaker.Speaker),
         cv.Optional(CONF_ON_PHASE): automation.validate_automation(
             {
@@ -68,6 +70,7 @@ async def to_code(config):
     cg.add(var.set_url(config[CONF_URL]))
     cg.add(var.set_token(config[CONF_TOKEN]))
     cg.add(var.set_mic_channel(config[CONF_MIC_CHANNEL]))
+    cg.add(var.set_barge_in(config[CONF_BARGE_IN]))
 
     mic = await cg.get_variable(config[CONF_MICROPHONE])
     cg.add(var.set_microphone(mic))
