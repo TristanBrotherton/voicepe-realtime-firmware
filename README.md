@@ -14,7 +14,9 @@
 
 - **Direct use in ESPHome Builder**: `external_components` and sound/model
   assets are pulled from GitHub, so you can paste the va-direct config into the
-  ESPHome dashboard and build without a local checkout.
+  ESPHome dashboard and build without a local checkout. This repo is **private**,
+  so the component source URL carries a read-only token kept in `secrets.yaml`
+  (see setup below) — the token never lands in the committed config.
 - **"stop" word interrupt** (kept from the Voice PE design): say *"stop"* while
   the assistant is talking (or press the center button) to cancel the reply.
 - **Handsfree barge-in** (`barge_in: true` in the `va_client:` block): the mic
@@ -30,10 +32,14 @@
    (sets your OpenAI key, the model, and the ha-mcp URL/token).
 2. In the ESPHome dashboard, create a device from
    [`home-assistant-voice.va-direct.yaml`](home-assistant-voice.va-direct.yaml).
-3. Provide these `secrets.yaml` keys: your Wi-Fi credentials (as upstream) and
-   `va_device_token` (any non-empty string for now). Optionally override the
-   `va_url` substitution if your add-on isn't reachable at
-   `ws://homeassistant.local:8080/`.
+3. Provide these `secrets.yaml` keys:
+   - `va_device_token` — any non-empty string for now.
+   - `va_components_repo` — the tokenized git URL for this private repo, e.g.
+     `https://<TOKEN>@github.com/xandervanerven/home-assistant-voice-pe.git`
+     (GitHub fine-grained PAT, Contents: read on this repo only).
+   - your Wi-Fi credentials (as upstream), if your base config uses them.
+   - Optionally override the `va_url` substitution if your add-on isn't reachable
+     at `ws://homeassistant.local:8080/`.
 4. Install/flash. The device connects to the add-on and you're ready.
 
 ---

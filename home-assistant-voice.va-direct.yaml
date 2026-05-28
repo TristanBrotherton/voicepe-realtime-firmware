@@ -1739,14 +1739,21 @@ external_components:
     components:
       - voice_kit
     refresh: 0s
-  # va_client (OpenAI-realtime thin client) + udp_log live in this fork. Pull
-  # them from GitHub so the config works as-is when pasted into the ESPHome
-  # Builder / dashboard without a local checkout. If you cloned the repo and
-  # want to iterate on the C++ locally, swap this back to:
+  # va_client (OpenAI-realtime thin client) + udp_log live in this fork. They
+  # are pulled from GitHub so the config works as-is when pasted into the
+  # ESPHome Builder / dashboard without a local checkout.
+  #
+  # This repo is PRIVATE, so the URL carries a read-only token and is kept in
+  # secrets.yaml (gitignored — the token never lands in the committed config).
+  # Add to secrets.yaml:
+  #   va_components_repo: "https://<TOKEN>@github.com/xandervanerven/home-assistant-voice-pe.git"
+  # Use a GitHub fine-grained PAT scoped to this repo with Contents: read.
+  # (If you make the repo public, just use the plain https URL instead.)
+  # To iterate on the C++ locally, swap this for:
   #   - source: {type: local, path: esphome/components}
   - source:
       type: git
-      url: https://github.com/xandervanerven/home-assistant-voice-pe
+      url: !secret va_components_repo
       ref: dev
     components: [va_client, udp_log]
     refresh: 0s
