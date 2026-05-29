@@ -82,9 +82,11 @@ esphome:
       - delay: 1s
       - switch.turn_on: internal_speaker_amp
       # va-direct: original on_client_connected did clear-init + start-mww +
-      # phase=idle. Replicate here. The control_leds dispatcher will route
-      # to no_ha_connection (red twinkle) until both wifi and va_client WS
-      # come up — then it falls through to the idle phase naturally.
+      # phase=idle. clear-init + phase=idle stay here; micro_wake_word.start
+      # moved to api.on_client_connected (see above) because on_boot+1s raced
+      # the XMOS voice-kit and mWW never heard the mic. The control_leds
+      # dispatcher routes to no_ha_connection (red twinkle) until both wifi and
+      # va_client WS come up — then it falls through to the idle phase naturally.
       - lambda: id(init_in_progress) = false;
       # Seed va_client with the restored media_player volume so the first
       # TTS reply respects the user's volume setting instead of blasting
@@ -92,7 +94,6 @@ esphome:
       - lambda: |-
           id(va).set_volume(id(external_media_player).is_muted() ? 0.0f
                                                                  : id(external_media_player).volume);
-      - micro_wake_word.start:
       - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
       - script.execute: control_leds
       # If after 10 minutes, the device is still initializing (It did not yet connect to Home Assistant), turn off the init_in_progress variable and run the script to refresh the LED status
@@ -185,6 +186,20 @@ ota:
 api:
   encryption:
     key: !secret api_key
+  # va-direct: start micro_wake_word HERE (mirrors stock home-assistant-voice.yaml
+  # and the fjfricke reference) instead of on_boot. Starting mWW at on_boot+1s
+  # raced the XMOS voice-kit coming up, so mWW could begin reading a mic that
+  # wasn't streaming yet and never recover — the wake word silently never fired.
+  # on_client_connected runs once HA + WiFi + the audio path are fully up.
+  on_client_connected:
+    - micro_wake_word.start:
+    # Keep "stop" disabled in the resting/idle state; on_phase arms it only while
+    # the assistant is replying. Explicit here so the boot state is deterministic
+    # regardless of whether the HA api or the va_client WS connects first.
+    - micro_wake_word.disable_model: stop
+    - script.execute: control_leds
+  on_client_disconnected:
+    - script.execute: control_leds
 
 # Diagnostics surfaced to Home Assistant (so they can be read remotely without
 # a serial cable): the last reset reason (e.g. "Task watchdog" / "Software" /
@@ -1080,6 +1095,39 @@ light:
             }
             index = (index + 1);
 
+      # va-direct: blue breathing pulse for the connected+idle state (lifted from
+      # the fjfricke reference firmware). Referenced by
+      # control_leds_voice_assistant_idle_phase so the ring glows while the
+      # va_client WebSocket is connected.
+      - addressable_lambda:
+          name: "Active Pulse"
+          update_interval: 50ms
+          lambda: |-
+            static uint8_t brightness_step = 0;
+            static bool brightness_increasing = true;
+            static uint8_t brightness_steps = 20;
+            if (initial_run) {
+              brightness_step = 0;
+              brightness_increasing = true;
+            }
+            Color blue(0, 0, 255);
+            uint8_t brightness = (brightness_step * 255) / brightness_steps;
+            Color pulse_color = blue * brightness;
+            for (uint8_t i = 0; i < 12; i++) {
+              it[i] = pulse_color;
+            }
+            if (brightness_increasing) {
+              brightness_step++;
+              if (brightness_step >= brightness_steps) {
+                brightness_increasing = false;
+              }
+            } else {
+              brightness_step--;
+              if (brightness_step == 0) {
+                brightness_increasing = true;
+              }
+            }
+
   # User facing LED ring. Remapping of the internal LEDs.
   # Exposed to be used by the user.
   - platform: partition
@@ -1274,12 +1322,25 @@ script:
   # Nothing (Either LED ring off or LED ring on if the user decided to turn the user facing LED ring on)
   - id: control_leds_voice_assistant_idle_phase
     then:
-      - light.turn_off: voice_assistant_leds
+      # va-direct: when the va_client WebSocket is connected, show a gentle blue
+      # breathing pulse at idle so there's a visible "ready" state (as the user
+      # wants, like the reference firmware). When the WS is down, keep the stock
+      # behaviour: ring off unless the user manually turned on the led_ring light.
       - if:
           condition:
-            light.is_on: led_ring
+            lambda: 'return id(va)->is_connected();'
           then:
-            light.turn_on: led_ring
+            - light.turn_on:
+                id: voice_assistant_leds
+                brightness: !lambda 'return max(id(led_ring).current_values.get_brightness(), 0.2f);'
+                effect: "Active Pulse"
+          else:
+            - light.turn_off: voice_assistant_leds
+            - if:
+                condition:
+                  light.is_on: led_ring
+                then:
+                  - light.turn_on: led_ring
 
   # Script executed when the voice assistant is waiting for a command (After the wake word)
   # Slow clockwise spin of the LED ring.
@@ -1866,6 +1927,16 @@ va_client:
           id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
         }
     - script.execute: control_leds
+    # va-direct: re-arm the wake word whenever we return to idle. micro_wake_word
+    # is the sole owner that starts the i2s_mics stream in this fork, so this
+    # guarantees detection is running again after every session teardown / WS
+    # (re)connect, mirroring the reference's on_disconnected restart. Idempotent
+    # if already running.
+    - if:
+        condition:
+          lambda: 'return phase == "idle";'
+        then:
+          - micro_wake_word.start:
     # Arm the "stop" wake word only while the assistant is actually
     # speaking — that's the only moment it's useful, and keeping it
     # disabled otherwise prevents false positives during user speech
@@ -1941,17 +2012,25 @@ micro_wake_word:
     gain_factor: 4
   stop_after_detection: false
   models:
-    - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json
-      id: okay_nabu
-    - model: hey_jarvis
-      id: hey_jarvis
-    - model: hey_mycroft
-      id: hey_mycroft
+    # PERSONAL VARIANT: alexa-only start wake word (microWakeWord v2.1).
+    # The stock start words (okay_nabu / hey_jarvis / hey_mycroft) were
+    # removed on purpose. "stop" stays — it's the reliable barge-in/interrupt
+    # word, armed only while the assistant is replying (see on_phase below).
+    # kahrendt/microWakeWord redirects to the OHF-Voice org automatically.
+    - model: https://github.com/kahrendt/microWakeWord/releases/download/v2.1_models/alexa.json
+      id: alexa
     - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
       id: stop
       internal: true
   vad:
   on_wake_word_detected:
+    # TEMP DEBUG (va-direct): log EVERY detection BEFORE the mute guard, so the
+    # next flash's log tells "mWW never fired" (mic/XMOS problem) apart from
+    # "fired but swallowed by the mute switch". Remove once wake word is confirmed.
+    - logger.log:
+        format: "WAKE fired: '%s' (muted=%d)"
+        args: ['wake_word.c_str()', 'id(master_mute_switch).state']
+        level: WARN
     # If the wake word is detected when the device is muted (Possible with the software mute switch): Do nothing
     - if:
         condition:
@@ -2114,20 +2193,17 @@ select:
       # Sets specific wake word probabilities computed for each particular model
       # Note probability cutoffs are set as a quantized uint8 value, each comment has the corresponding floating point cutoff
       # False Accepts per Hour values are tested against all units and channels from the Dinner Party Corpus.
-      # These cutoffs apply only to the specific models included in the firmware: okay_nabu@20241226.3, hey_jarvis@v2, hey_mycroft@v2
+      # PERSONAL VARIANT: only the alexa@v2.1 model is built in now, so the
+      # three tiers just adjust its cutoff. Cutoffs are quantized uint8
+      # (round(probability * 255)); LOWER = more sensitive = more false
+      # accepts. Spacing mirrors the proven okay_nabu tiers.
       lambda: |-
         if (x == "Slightly sensitive") {
-          id(okay_nabu).set_probability_cutoff(217);    // 0.85 -> 0.000 FAPH on DipCo (Manifest's default)
-          id(hey_jarvis).set_probability_cutoff(247);   // 0.97 -> 0.563 FAPH on DipCo (Manifest's default)
-          id(hey_mycroft).set_probability_cutoff(253);  // 0.99 -> 0.567 FAPH on DipCo
+          id(alexa).set_probability_cutoff(217);   // ~0.85
         } else if (x == "Moderately sensitive") {
-          id(okay_nabu).set_probability_cutoff(176);    // 0.69 -> 0.376 FAPH on DipCo
-          id(hey_jarvis).set_probability_cutoff(235);   // 0.92 -> 0.939 FAPH on DipCo
-          id(hey_mycroft).set_probability_cutoff(242);  // 0.95 -> 1.502 FAPH on DipCo (Manifest's default)
+          id(alexa).set_probability_cutoff(178);   // ~0.70
         } else if (x == "Very sensitive") {
-          id(okay_nabu).set_probability_cutoff(143);    // 0.56 -> 0.751 FAPH on DipCo
-          id(hey_jarvis).set_probability_cutoff(212);   // 0.83 -> 1.502 FAPH on DipCo
-          id(hey_mycroft).set_probability_cutoff(237);  // 0.93 -> 1.878 FAPH on DipCo
+          id(alexa).set_probability_cutoff(140);   // ~0.55
         }
 
 
