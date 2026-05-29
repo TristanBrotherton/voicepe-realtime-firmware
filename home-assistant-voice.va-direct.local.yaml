@@ -1,10 +1,11 @@
 # ============================================================================
 # PERSONAL VARIANT of home-assistant-voice.va-direct.yaml.
-# Identical to the general config EXCEPT for three blocks, each marked
+# Identical to the general config EXCEPT for four blocks, each marked
 # "PERSONAL VARIANT" below:
 #   1. substitutions: device name + Wi-Fi creds + static IP (right here)
 #   2. esphome: uses ${name}/${friendly_name}, no MAC suffix
 #   3. wifi: inline ssid/password + manual_ip (static), keeps the AP fallback
+#   4. ota: an OTA upload password (!secret ota_password)
 # All the voice logic lives in the va_client component (pulled from GitHub),
 # so this file rarely needs syncing. Wi-Fi credentials stay in secrets.yaml.
 # ============================================================================
@@ -171,6 +172,9 @@ logger:
 ota:
   - platform: esphome
     id: ota_esphome
+    # PERSONAL VARIANT: OTA upload password. Match your existing device's
+    # password so wireless updates keep working; define it in secrets.yaml.
+    password: !secret ota_password
 
 # va-direct: we removed `api:` (HA no longer talks to this device — audio
 # goes over va_client WS, tools go via the MCP server on the backend), but
