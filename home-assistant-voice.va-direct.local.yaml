@@ -1905,9 +1905,12 @@ va_client:
   # Handsfree barge-in: keep the mic open while the assistant is speaking so
   # you can talk over it and the backend's server VAD will cut the reply off.
   # Relies on the XMOS AEC to suppress speaker->mic echo (imperfect — see
-  # CLAUDE.md). Set to false for the original turn-based behaviour (mic closed
-  # while replying; interrupt only via the "stop" word or the center button).
-  barge_in: true
+  # CLAUDE.md). DISABLED: on this hardware the ~10x speaker->mic leak fed back
+  # into the open mic during the reply, the (semantic) VAD flapped
+  # listening<->thinking and once built into a loud acoustic-feedback squeal.
+  # false = original turn-based behaviour (mic closed while replying; interrupt
+  # only via the "stop" word or the center button) — clean turns, no feedback.
+  barge_in: false
   # Write raw PCM16 mono 24kHz into the media resampler. We can't share the
   # announcement lane with external_media_player — va_client grabs the
   # resampling speaker on setup and holds it, which prevents the upstream
