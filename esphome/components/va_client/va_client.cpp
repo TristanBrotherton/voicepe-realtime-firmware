@@ -498,11 +498,15 @@ void VaClient::set_phase_(const std::string &phase) {
 
   // Streaming gate state machine:
   //   listening  → mic on (user is being heard)
-  //   thinking   → mic off (server processing; sending more burns WS bandwidth
-  //                that TTS needs, and OpenAI ignores audio while a response
-  //                is in flight)
-  //   replying   → mic off (also avoids picking up our own TTS in case XMOS
-  //                AEC isn't perfect)
+  //   thinking   → mic stays on. `thinking` only means "the VAD thinks the user
+  //                stopped", but with semantic_vad it can flap listening↔thinking
+  //                at the start of a turn while the user is still talking. No bot
+  //                audio plays during thinking (no echo risk), so keep streaming
+  //                until the reply genuinely begins — otherwise a spurious
+  //                `thinking` cuts the mic, the backend's input watchdog
+  //                force-ends the turn with no transcript, and the turn hangs.
+  //   replying   → mic off (bot is speaking; gate to avoid picking up our own
+  //                TTS in case the XMOS AEC isn't perfect). barge_in keeps it on.
   //   idle       → mic on for kFollowupMs so the user can answer a question
   //                without re-triggering the wake word. Timer expiry closes
   //                the session.
@@ -533,12 +537,16 @@ void VaClient::set_phase_(const std::string &phase) {
     this->cancel_timeout("va_no_speech");
     this->cancel_timeout("va_followup");
   } else if (phase == "thinking" || phase == "replying") {
-    // With handsfree barge-in the mic stays open through thinking/replying so
-    // the user can interrupt; the backend's server VAD + the XMOS AEC decide
-    // when that's a real barge-in. Without it, fall back to the original
-    // turn-based gate (mic off while the assistant is busy/speaking).
-    if (this->streaming_ && !this->barge_in_) {
-      ESP_LOGI(TAG, "phase=%s — mic streaming off", phase.c_str());
+    // Gate the mic off only once the bot actually starts speaking (`replying`).
+    // With handsfree barge-in we don't gate at all (the server VAD + XMOS AEC
+    // arbitrate talk-over). Crucially we do NOT gate on `thinking`: semantic_vad
+    // can flap listening↔thinking at the start of a turn while the user is still
+    // speaking, and cutting the mic on those spurious flaps starves the backend
+    // of audio → its input watchdog force-ends the turn with no transcript → the
+    // turn hangs in thinking. No bot audio plays during thinking, so there's no
+    // echo cost to keeping the mic open until the reply genuinely starts.
+    if (phase == "replying" && this->streaming_ && !this->barge_in_) {
+      ESP_LOGI(TAG, "phase=replying — mic streaming off");
       this->streaming_ = false;
     }
     if (phase == "thinking" && this->turn_t_thinking_ == 0 && this->turn_t_wake_ != 0) {
