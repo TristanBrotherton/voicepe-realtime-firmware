@@ -133,6 +133,12 @@ esp32:
 wifi:
   id: wifi_id
   fast_connect: ${hidden_ssid}
+  # CRACKLE FIX (secondary): disable WiFi modem light-sleep. ESPHome's default
+  # power_save_mode on ESP32 batches RX while the radio dozes, adding periodic
+  # latency to incoming WS audio frames (the sub-second "ws audio gap" warnings).
+  # none = radio always on → steadier frame arrival, fewer jitter-driven dropouts
+  # during replies. Costs ~20-40mA extra (this device is mains-powered, so fine).
+  power_save_mode: none
   # PERSONAL VARIANT: inline credentials + static IP (no improv needed for
   # this device). The improv blocks below stay as a fallback for re-setup.
   ssid: ${wifi_ssid}
@@ -1748,16 +1754,28 @@ speaker:
       - id: media_mixing_input
         timeout: never
 
+  # timeout: never — CRACKLE FIX. Without it the resampler defaults to a 500ms
+  # idle timeout and STOPS itself between replies (log: resampler_speaker
+  # Stopped). The next reply then has to cold-start the resampler+mixer tasks
+  # while the first frame is already handed to play() → the i2s sink underflows
+  # one ~20ms frame at the START of the answer → an audible click. (Confirmed in
+  # device.log: every "downstream underrun" is bracketed by resampler Stopped→
+  # Starting; warm back-to-back replies have none.) The mixer SOURCES already use
+  # timeout: never; the resamplers were missing it, so the chain still went cold.
+  # A playback prebuffer can't fix this — it buffers UPSTREAM of the resampler,
+  # but the dry stage is the resampler/mixer being (re)constructed downstream.
   - platform: resampler
     id: announcement_resampling_speaker
     output_speaker: announcement_mixing_input
     sample_rate: 48000
     bits_per_sample: 16
+    timeout: never
   - platform: resampler
     id: media_resampling_speaker
     output_speaker: media_mixing_input
     sample_rate: 48000
     bits_per_sample: 16
+    timeout: never
 
 media_player:
   - platform: speaker_source
