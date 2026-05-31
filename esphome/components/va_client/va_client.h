@@ -216,6 +216,27 @@ class VaClient : public Component {
   // millis() when priming started (first byte after the ring was empty); used
   // for the prime deadline so real-time (non-burst) audio still starts promptly.
   uint32_t prime_started_ms_{0};
+
+  // Resampler cold-start SILENCE-PRIME (crackle fix). The resampler speaker has
+  // no `timeout` config option, so it self-stops after ~500ms idle between
+  // replies (log: resampler_speaker Stopped). The next reply then cold-starts
+  // it: its windowed-sinc FIR filter begins from a zero state and the first real
+  // speech sample drives a startup transient = an audible click at the start of
+  // the answer. A PSRAM prebuffer can't fix it (the transient is in the
+  // resampler, downstream of the ring). Fix: when we detect the chain is cold
+  // (nothing fed for > kChainColdMs, i.e. it has timed out), feed kChainPrimeMs
+  // of SILENCE into the resampler first so its filter settles to a clean zero
+  // output before real audio arrives. Cold detection is time-based (mirrors the
+  // resampler's own idle timeout) so it fires ONLY at a true cold reply-start,
+  // never mid-speech — priming mid-reply would inject an audible silence gap.
+  static constexpr uint32_t kChainPrimeMs = 60;   // silence burst to warm the filter
+  static constexpr uint32_t kChainColdMs = 600;   // > resampler ~500ms idle timeout
+  // Bytes of silence still to feed this cold-start (24kHz mono 16-bit). >0 while
+  // priming; loop() feeds silence and holds real-audio drain until it reaches 0.
+  size_t chain_prime_remaining_{0};
+  // millis() of the last time we fed the resampler ANYTHING (silence or real).
+  // Used to detect a cold chain: now - last_fed_ms_ > kChainColdMs. 0 = never fed.
+  uint32_t last_fed_ms_{0};
   // Legacy compile-time default, kept for reference. The live value now comes
   // from the backend (followup_ms_); this stays 0 so a device talking to an
   // old backend that doesn't send follow_up_ms keeps the turn-based behaviour.

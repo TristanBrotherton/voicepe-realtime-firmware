@@ -105,6 +105,37 @@ void VaClient::loop() {
     size_t fill = this->audio_fill_;
     portEXIT_CRITICAL(&this->ring_mux_);
     if (fill > 0) {
+      // Resampler cold-start SILENCE-PRIME (crackle fix). If the resampler has
+      // gone cold (self-stopped after its ~500ms idle timeout — it has no
+      // `timeout` config option), warm it with kChainPrimeMs of silence BEFORE
+      // the first real speech sample, so its windowed-sinc FIR filter settles to
+      // a clean zero state and there's no startup-transient click. We detect
+      // "cold" purely by time (nothing fed for > kChainColdMs), which only ever
+      // happens at a genuine reply start after idle — never mid-speech — so we
+      // never inject a silence gap into ongoing audio. The real audio waits
+      // safely in PSRAM (and builds a small cushion) until priming completes.
+      {
+        const uint32_t now_ms = millis();
+        if (this->chain_prime_remaining_ == 0 &&
+            (this->last_fed_ms_ == 0 || (now_ms - this->last_fed_ms_) > kChainColdMs)) {
+          this->chain_prime_remaining_ =
+              (size_t) kChainPrimeMs * (kPlaybackSampleRate / 1000) * 2;  // ms→bytes (mono 16-bit)
+          ESP_LOGD(TAG, "resampler cold — priming %u bytes of silence before reply",
+                   (unsigned) this->chain_prime_remaining_);
+        }
+        if (this->chain_prime_remaining_ > 0) {
+          static const uint8_t kSilence[480] = {0};  // 10ms @24k mono16; fed in chunks
+          size_t want = std::min(this->chain_prime_remaining_, sizeof(kSilence));
+          size_t fed = this->speaker_->play(kSilence, want);
+          if (fed > 0) {
+            this->chain_prime_remaining_ -= fed;
+            this->last_fed_ms_ = now_ms;  // count silence as "fed" so cold-check clears
+          }
+          // Hold real-audio drain until the chain is warmed. Real audio stays in
+          // PSRAM. Re-enter loop() next tick to continue/finish priming.
+          return;
+        }
+      }
       // Jitter buffer priming gate. After the ring was empty (reply start or a
       // post-underflow gap) hold playback until either the prebuffer cushion has
       // accumulated (fill >= target) or a deadline elapses (so real-time, non-
@@ -142,6 +173,7 @@ void VaClient::loop() {
       // across it would block the writer and cause audio underrun.
       size_t accepted = this->speaker_->play(this->audio_buf_ + head, contiguous);
       if (accepted > 0) {
+        this->last_fed_ms_ = millis();  // keep the chain "warm" for cold-detection
         portENTER_CRITICAL(&this->ring_mux_);
         this->audio_head_ = (this->audio_head_ + accepted) % kAudioBufBytes;
         this->audio_fill_ -= accepted;
@@ -1006,6 +1038,9 @@ void VaClient::send_interrupt() {
   this->suppress_incoming_audio_ = true;
   // Ring was just flushed; re-arm the jitter buffer fresh for the next reply.
   this->playback_priming_ = false;
+  // Abandon any in-progress cold-start silence-prime; the next reply will detect
+  // cold and re-prime cleanly.
+  this->chain_prime_remaining_ = 0;
   this->followup_pending_ = false;
   this->waiting_for_speaker_stop_ = false;
   this->request_follow_up_pending_ = false;
