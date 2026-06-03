@@ -106,19 +106,29 @@ void VaClient::loop() {
     size_t fill = this->audio_fill_;
     portEXIT_CRITICAL(&this->ring_mux_);
     if (fill > 0) {
-      // Resampler cold-start SILENCE-PRIME (crackle fix). If the resampler has
-      // gone cold (self-stopped after its ~500ms idle timeout — it has no
-      // `timeout` config option), warm it with kChainPrimeMs of silence BEFORE
-      // the first real speech sample, so its windowed-sinc FIR filter settles to
-      // a clean zero state and there's no startup-transient click. We detect
-      // "cold" purely by time (nothing fed for > kChainColdMs), which only ever
-      // happens at a genuine reply start after idle — never mid-speech — so we
-      // never inject a silence gap into ongoing audio. The real audio waits
-      // safely in PSRAM (and builds a small cushion) until priming completes.
+      // Resampler cold-start SILENCE-PRIME (crackle fix). The resampler does NOT
+      // idle-timeout (verified vs ESPHome source): resample(stop_gracefully=false)
+      // never returns FINISHED, and its output mixer-source is timeout:never, so the
+      // chain stays WARM between normal replies. It goes COLD only after an explicit
+      // `speaker.stop: media_resampling_speaker` (yaml interrupt / "stop" word / wake /
+      // follow-up), which tears the task down to STATE_STOPPED. The next reply then
+      // cold-starts a fresh AudioResampler whose windowed-sinc FIR begins from a zero
+      // state → a startup-transient click. A PSRAM prebuffer can't fix it (the transient
+      // is downstream of the ring). Fix: when cold, feed kChainPrimeMs of silence BEFORE
+      // the first real sample so the FIR settles to a clean zero output first. We detect
+      // "cold" two ways: the resampler actually reporting is_stopped() (true exactly
+      // post-speaker.stop — the precise signal) OR, as a backup, nothing fed for
+      // > kChainColdMs. is_stopped() closes the window the timer alone misses: a reply
+      // whose audio lands < kChainColdMs after a speaker.stop (the residual click). A
+      // needless prime on an already-warm chain is harmless (60ms of silence); both
+      // signals are only ever true at a real cold reply-start, never mid-speech. The
+      // real audio waits safely in PSRAM (and builds a small cushion) until priming done.
       {
         const uint32_t now_ms = millis();
-        if (this->chain_prime_remaining_ == 0 &&
-            (this->last_fed_ms_ == 0 || (now_ms - this->last_fed_ms_) > kChainColdMs)) {
+        const bool resampler_cold = this->speaker_->is_stopped() ||
+                                    this->last_fed_ms_ == 0 ||
+                                    (now_ms - this->last_fed_ms_) > kChainColdMs;
+        if (this->chain_prime_remaining_ == 0 && resampler_cold) {
           this->chain_prime_remaining_ =
               (size_t) kChainPrimeMs * (kPlaybackSampleRate / 1000) * 2;  // ms→bytes (mono 16-bit)
           ESP_LOGD(TAG, "resampler cold — priming %u bytes of silence before reply",
