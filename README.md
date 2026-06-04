@@ -48,11 +48,12 @@
    [`secrets.yaml.example`](secrets.yaml.example): `wifi_ssid`, `wifi_password`,
    `ota_password`, `api_key` (plus `static_ip`/`gateway`/`subnet`/`dns1`/`dns2`
    only if you want a fixed IP).
-3. Create a new device in the dashboard and replace its YAML with the stub from
-   [`device.example.yaml`](device.example.yaml): set `name`/`friendly_name` and
-   keep the `packages:`/`dashboard_import:` lines. (For a fixed IP, follow the
-   comments at the bottom of the stub.) Optionally override the `va_url`
-   substitution if your add-on isn't at `ws://homeassistant.local:8080/`.
+3. Create a new device in the dashboard and replace its YAML with a ready-made
+   stub — [`device.example.yaml`](device.example.yaml) for DHCP, or
+   [`device.example.static-ip.yaml`](device.example.static-ip.yaml) for a fixed IP.
+   Set `name`/`friendly_name` and keep the `packages:`/`dashboard_import:` lines.
+   Optionally override the `va_url` substitution if your add-on isn't at
+   `ws://homeassistant.local:8080/`.
 4. **Install** once (USB, then wireless thereafter). The device adopts the
    firmware and connects to the add-on.
 
