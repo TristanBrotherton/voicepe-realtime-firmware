@@ -6,6 +6,8 @@
 > runs the OpenAI Realtime session and controls Home Assistant. You must set up both:
 > - 🔌 **Device firmware** (this repo) — flashed onto the Voice PE
 > - 🧠 **Backend add-on** → **[xandervanerven/ha-openai-realtime](https://github.com/xandervanerven/ha-openai-realtime)** (runs in Home Assistant)
+>
+> 📖 New here? The full **[INSTALL guide](INSTALL.md)** sets up both halves, step by step.
 
 > **Customized fork** of `maxmaxme/home-assistant-voice-pe` (itself a fork of
 > `esphome/home-assistant-voice-pe`). The Voice PE runs as a **thin client**: it
