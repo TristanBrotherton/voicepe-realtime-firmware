@@ -30,11 +30,6 @@
 - **"stop" word + button interrupt**: say *"stop"* while the assistant is
   talking, or press the center button, to cancel the reply. This is the reliable
   way to interrupt.
-- **Turn-based mic gating** (`barge_in: false`): the mic is closed while the
-  assistant speaks, so its own TTS can't feed back through the (imperfect) XMOS
-  AEC. Seamless handsfree barge-in was evaluated and **shelved** — it isn't
-  achievable on this hardware without custom XMOS DSP work — so the "stop"
-  word/button is the way to cut a reply short.
 - **Audio-quality fixes**: a resampler cold-start "silence-prime" plus WiFi
   `power_save_mode: none` remove the start-of-reply crackle, and a ~600 ms mic
   pre-roll ring keeps the first word spoken during the wake chime from being lost.
