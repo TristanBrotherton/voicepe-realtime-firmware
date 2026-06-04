@@ -1,7 +1,7 @@
 # ============================================================================
 # Per-device stub for the OpenAI Realtime Voice PE firmware -- FIXED IP variant.
 #
-# Same as device.example.yaml, but pinned to a static IP. Copy THIS into your
+# Same as esphome-builder.dhcp.yaml, but pinned to a static IP. Copy THIS into your
 # ESPHome dashboard ONCE (adopt the device, then edit its YAML). It pulls the
 # full firmware from this repo as a remote package, so updates are one click
 # ("Update available") in the dashboard -- no more copy-pasting the whole config.
@@ -12,7 +12,7 @@
 #        static_ip, gateway, subnet, dns1, dns2
 #   3. Install once. After that, click Update whenever a new version ships.
 #
-# (For DHCP instead of a fixed IP, use device.example.yaml.)
+# (For DHCP instead of a fixed IP, use esphome-builder.dhcp.yaml.)
 # ============================================================================
 substitutions:
   name: my-voice-pe                  # your device's name -- keep it stable!

@@ -28,6 +28,6 @@ dashboard_import:
   import_full_config: false
 
 # --- Fixed (static) IP? -----------------------------------------------------
-# This file uses DHCP. For a fixed IP, use device.example.static-ip.yaml instead
+# This file uses DHCP. For a fixed IP, use esphome-builder.static-ip.yaml instead
 # -- a ready-to-paste version with the manual_ip block already wired up.
 # ============================================================================

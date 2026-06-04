@@ -9,10 +9,10 @@
 # as SUBSTITUTIONS (a remote package can't use !secret):
 #   name, friendly_name, wifi_ssid, wifi_password, ota_password, api_key
 #   (+ static_ip/gateway/subnet/dns1/dns2 and a manual_ip override for a fixed IP)
-# See device.example.yaml in this repo for the stub template.
+# See esphome-builder.dhcp.yaml in this repo for the stub template.
 # ============================================================================
 substitutions:
-  # Device identity comes from the per-device stub (device.example.yaml); these
+  # Device identity comes from the per-device stub (esphome-builder.dhcp.yaml); these
   # are safe defaults the stub overrides. Wi-Fi + secrets (wifi_ssid, wifi_password,
   # ota_password, api_key) MUST be provided by the stub as substitutions, because
   # a remote `packages:` include can't use !secret.

@@ -11,7 +11,7 @@
 >
 > The firmware config is [`home-assistant-voice.realtime.yaml`](home-assistant-voice.realtime.yaml).
 > You don't paste it directly — you adopt it via a tiny per-device stub
-> ([`device.example.yaml`](device.example.yaml)) that pulls it as a remote package,
+> ([`esphome-builder.dhcp.yaml`](esphome-builder.dhcp.yaml)) that pulls it as a remote package,
 > so updates are **one click** in the ESPHome dashboard (see Setup).
 >
 > Companion backend add-on: **[xandervanerven/ha-openai-realtime](https://github.com/xandervanerven/ha-openai-realtime)**.
@@ -49,8 +49,8 @@
    `ota_password`, `api_key` (plus `static_ip`/`gateway`/`subnet`/`dns1`/`dns2`
    only if you want a fixed IP).
 3. Create a new device in the dashboard and replace its YAML with a ready-made
-   stub — [`device.example.yaml`](device.example.yaml) for DHCP, or
-   [`device.example.static-ip.yaml`](device.example.static-ip.yaml) for a fixed IP.
+   stub — [`esphome-builder.dhcp.yaml`](esphome-builder.dhcp.yaml) for DHCP, or
+   [`esphome-builder.static-ip.yaml`](esphome-builder.static-ip.yaml) for a fixed IP.
    Set `name`/`friendly_name` and keep the `packages:`/`dashboard_import:` lines.
    Optionally override the `va_url` substitution if your add-on isn't at
    `ws://homeassistant.local:8080/`.
