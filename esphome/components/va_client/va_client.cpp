@@ -275,13 +275,8 @@ void VaClient::connect_() {
     return;
   }
 
-  // Keep the header string alive for the entire lifetime of the client; the
-  // config struct only stores a pointer.
-  this->auth_header_ = "Authorization: Bearer " + this->token_ + "\r\n";
-
   esp_websocket_client_config_t cfg = {};
   cfg.uri = this->url_.c_str();
-  cfg.headers = this->auth_header_.c_str();
   cfg.disable_auto_reconnect = true;  // we drive reconnects ourselves with exponential backoff
   cfg.reconnect_timeout_ms = 5000;    // ignored because disable_auto_reconnect=true
 

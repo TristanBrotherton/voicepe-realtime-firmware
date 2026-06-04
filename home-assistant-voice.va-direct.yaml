@@ -39,9 +39,7 @@ substitutions:
   # change this if your HA host has a different name/IP, e.g.
   # "ws://192.168.1.10:8080/".
   va_url: "ws://homeassistant.local:8080/"
-  # va_device_token must be defined in secrets.yaml (do NOT inline). The
-  # add-on does not enforce it today, so any non-empty string works; keep it
-  # for forward-compatibility with a future authenticated handshake.
+  # (device→add-on WebSocket needs no auth token; it's a LAN-local service.)
 
 esphome:
   name: home-assistant-voice
@@ -1801,7 +1799,6 @@ time:
 va_client:
   id: va
   url: ${va_url}
-  token: !secret va_device_token
   microphone: i2s_mics
   mic_channel: 0
   # Handsfree barge-in: keep the mic open while the assistant is speaking so

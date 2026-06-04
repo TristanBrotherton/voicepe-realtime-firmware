@@ -21,7 +21,6 @@ class OnFollowupOpenedTrigger;
 class VaClient : public Component {
  public:
   void set_url(const std::string &url) { url_ = url; }
-  void set_token(const std::string &token) { token_ = token; }
   void set_microphone(microphone::Microphone *m) { mic_ = m; }
   void set_mic_channel(uint8_t c) { mic_channel_ = c; }
   void set_speaker(speaker::Speaker *s) { speaker_ = s; }
@@ -86,9 +85,6 @@ class VaClient : public Component {
   void open_followup_window_(uint32_t duration_ms);
 
   std::string url_;
-  std::string token_;
-  // Lifetime-stable storage referenced by esp_websocket_client_config_t.headers.
-  std::string auth_header_;
   uint8_t mic_channel_{0};
 
   microphone::Microphone *mic_{nullptr};

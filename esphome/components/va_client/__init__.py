@@ -8,7 +8,6 @@ from esphome.const import CONF_ID, CONF_URL, CONF_TRIGGER_ID
 CODEOWNERS = ["@maxmaxme"]
 DEPENDENCIES = ["network", "microphone", "speaker"]
 
-CONF_TOKEN = "token"
 CONF_MICROPHONE = "microphone"
 CONF_MIC_CHANNEL = "mic_channel"
 CONF_SPEAKER = "speaker"
@@ -33,7 +32,6 @@ CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(VaClient),
         cv.Required(CONF_URL): cv.string,
-        cv.Required(CONF_TOKEN): cv.string,
         cv.Required(CONF_MICROPHONE): cv.use_id(microphone.Microphone),
         cv.Optional(CONF_MIC_CHANNEL, default=0): cv.int_range(min=0, max=1),
         cv.Optional(CONF_BARGE_IN, default=True): cv.boolean,
@@ -68,7 +66,6 @@ async def to_code(config):
     await cg.register_component(var, config)
 
     cg.add(var.set_url(config[CONF_URL]))
-    cg.add(var.set_token(config[CONF_TOKEN]))
     cg.add(var.set_mic_channel(config[CONF_MIC_CHANNEL]))
     cg.add(var.set_barge_in(config[CONF_BARGE_IN]))
 

@@ -33,7 +33,6 @@
 2. In the ESPHome dashboard, create a device from
    [`home-assistant-voice.va-direct.yaml`](home-assistant-voice.va-direct.yaml).
 3. Provide these `secrets.yaml` keys:
-   - `va_device_token` — any non-empty string for now.
    - `va_components_repo` — the tokenized git URL for this private repo, e.g.
      `https://<TOKEN>@github.com/xandervanerven/home-assistant-voice-pe.git`
      (GitHub fine-grained PAT, Contents: read on this repo only).
