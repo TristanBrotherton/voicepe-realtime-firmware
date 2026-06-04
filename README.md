@@ -9,9 +9,10 @@
 > integration. There is no Home Assistant `voice_assistant` pipeline on the audio
 > path — STT, TTS and the LLM all live in the Realtime session inside the add-on.
 >
-> **Configs (pick one to flash):**
-> - [`home-assistant-voice.realtime.yaml`](home-assistant-voice.realtime.yaml) — standard (DHCP).
-> - [`home-assistant-voice.realtime.static-ip.yaml`](home-assistant-voice.realtime.static-ip.yaml) — identical, plus a fixed IP read from `secrets.yaml`.
+> The firmware config is [`home-assistant-voice.realtime.yaml`](home-assistant-voice.realtime.yaml).
+> You don't paste it directly — you adopt it via a tiny per-device stub
+> ([`device.example.yaml`](device.example.yaml)) that pulls it as a remote package,
+> so updates are **one click** in the ESPHome dashboard (see Setup).
 >
 > Companion backend add-on: **[xandervanerven/ha-openai-realtime](https://github.com/xandervanerven/ha-openai-realtime)**.
 
@@ -21,11 +22,11 @@
   component: a thin WebSocket client (mic up / speaker down + an idle → listening
   → thinking → replying phase/LED state machine). All the voice intelligence
   runs in the backend add-on, not on the device.
-- **Builds straight in ESPHome Builder**: `external_components` and the sound/
-  model assets are pulled from GitHub, so you can paste a config into the ESPHome
-  dashboard and build without a local checkout. This repo is **private**, so the
-  component source URL carries a read-only token kept in `secrets.yaml` — it
-  never lands in the committed config.
+- **One-click updates**: instead of pasting the whole config, you adopt a tiny
+  per-device stub that pulls the firmware from this repo as a remote ESPHome
+  `packages:` include. When a new version ships, the ESPHome dashboard shows
+  "Update available" — one click recompiles with the latest. No local checkout,
+  no tokens (this repo is public).
 - **"stop" word + button interrupt**: say *"stop"* while the assistant is
   talking, or press the center button, to cancel the reply. This is the reliable
   way to interrupt.
@@ -43,22 +44,21 @@
 1. Install and configure the **OpenAI Realtime 2 Voice Agent** add-on from
    [xandervanerven/ha-openai-realtime](https://github.com/xandervanerven/ha-openai-realtime)
    (sets your OpenAI API key, the model, and the Home Assistant MCP connection).
-   See that repo's documentation for the add-on side.
-2. In the ESPHome dashboard, create a device from
-   [`home-assistant-voice.realtime.yaml`](home-assistant-voice.realtime.yaml)
-   (or the `…static-ip.yaml` variant if you want a fixed IP).
-3. Provide these `secrets.yaml` keys — see
-   [`secrets.yaml.example`](secrets.yaml.example) for the full template:
-   - `wifi_ssid`, `wifi_password` — your Wi-Fi network.
-   - `ota_password` — OTA upload password, so wireless updates keep working.
-   - `api_key` — the device's Home Assistant API encryption key.
-   - `va_components_repo` — the tokenized git URL for this private repo, e.g.
-     `https://<TOKEN>@github.com/xandervanerven/home-assistant-voice-pe.git`
-     (a GitHub fine-grained PAT with Contents: read on this repo only).
-   - **Static-IP variant only:** `static_ip`, `gateway`, `subnet`, `dns1`, `dns2`.
-   - Optionally override the `va_url` substitution if your add-on isn't reachable
-     at `ws://homeassistant.local:8080/`.
-4. Install / flash. The device connects to the add-on and you're ready.
+2. In **Builder → Secrets**, add the keys from
+   [`secrets.yaml.example`](secrets.yaml.example): `wifi_ssid`, `wifi_password`,
+   `ota_password`, `api_key` (plus `static_ip`/`gateway`/`subnet`/`dns1`/`dns2`
+   only if you want a fixed IP).
+3. Create a new device in the dashboard and replace its YAML with the stub from
+   [`device.example.yaml`](device.example.yaml): set `name`/`friendly_name` and
+   keep the `packages:`/`dashboard_import:` lines. (For a fixed IP, follow the
+   comments at the bottom of the stub.) Optionally override the `va_url`
+   substitution if your add-on isn't at `ws://homeassistant.local:8080/`.
+4. **Install** once (USB, then wireless thereafter). The device adopts the
+   firmware and connects to the add-on.
+
+After that, when a new firmware version is released the dashboard shows
+**"Update available"** for the device — click it to pull the latest config and
+re-flash. No more copy-pasting.
 
 ---
 

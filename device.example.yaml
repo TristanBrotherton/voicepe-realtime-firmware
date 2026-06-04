@@ -1,0 +1,49 @@
+# ============================================================================
+# Per-device stub for the OpenAI Realtime Voice PE firmware.
+#
+# Copy THIS into your ESPHome dashboard ONCE (add/adopt the device, then edit its
+# YAML). It pulls the full firmware from this repo as a remote `packages:` include,
+# so future updates are one click ("Update available") in the dashboard -- no more
+# copy-pasting the whole config.
+#
+#   1. Set `name` / `friendly_name` for your device.
+#   2. Put the keys below in your ESPHome secrets.yaml (Builder -> Secrets):
+#        wifi_ssid, wifi_password, ota_password, api_key
+#   3. Install once. After that, click Update whenever a new version ships.
+# ============================================================================
+substitutions:
+  name: my-voice-pe                  # your device's name -- keep it stable!
+  friendly_name: Home Assistant Voice
+  # Secrets -> substitutions (a remote package can't use !secret directly):
+  wifi_ssid: !secret wifi_ssid
+  wifi_password: !secret wifi_password
+  ota_password: !secret ota_password
+  api_key: !secret api_key
+
+packages:
+  realtime: github://xandervanerven/home-assistant-voice-pe/home-assistant-voice.realtime.yaml@main
+
+dashboard_import:
+  package_import_url: github://xandervanerven/home-assistant-voice-pe/home-assistant-voice.realtime.yaml@main
+  import_full_config: false
+
+# --- OPTIONAL: fixed (static) IP --------------------------------------------
+# DHCP is the default. To pin a static IP instead:
+#   a) add to secrets.yaml: static_ip, gateway, subnet, dns1, dns2
+#   b) add these 5 lines INSIDE the `substitutions:` block above:
+#         static_ip: !secret static_ip
+#         gateway: !secret gateway
+#         subnet: !secret subnet
+#         dns1: !secret dns1
+#         dns2: !secret dns2
+#   c) add this entry INSIDE the `packages:` block above (it merges a manual_ip
+#      into the firmware's wifi: config):
+#         static_ip:
+#           wifi:
+#             manual_ip:
+#               static_ip: ${static_ip}
+#               gateway: ${gateway}
+#               subnet: ${subnet}
+#               dns1: ${dns1}
+#               dns2: ${dns2}
+# ============================================================================

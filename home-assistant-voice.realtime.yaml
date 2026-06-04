@@ -1,23 +1,23 @@
 # ============================================================================
-# Home Assistant Voice PE - OpenAI Realtime firmware (standard / DHCP).
+# Home Assistant Voice PE - OpenAI Realtime firmware.
 # Our customized thin-client: all voice logic lives in the va_client component
 # (pulled from GitHub), streaming audio to the OpenAI Realtime backend add-on.
 #
-# This is the standard config - the device gets its IP from DHCP. If you need a
-# fixed IP, use home-assistant-voice.realtime.static-ip.yaml instead (identical,
-# plus a manual_ip block reading static_ip/gateway/subnet/dns from secrets.yaml).
-#
-# Required secrets.yaml keys: wifi_ssid, wifi_password, ota_password, api_key,
-# va_components_repo.
+# This config is meant to be pulled as a remote ESPHome `packages:` include from
+# a small per-device stub, so updates are one click in the dashboard (no more
+# copy-pasting the whole file). The stub provides the device identity + secrets
+# as SUBSTITUTIONS (a remote package can't use !secret):
+#   name, friendly_name, wifi_ssid, wifi_password, ota_password, api_key
+#   (+ static_ip/gateway/subnet/dns1/dns2 and a manual_ip override for a fixed IP)
+# See device.example.yaml in this repo for the stub template.
 # ============================================================================
 substitutions:
-  # --- This device's identity + Wi-Fi (sensitive values via !secret) ---
-  name: home-assistant-voice-096fcc
+  # Device identity comes from the per-device stub (device.example.yaml); these
+  # are safe defaults the stub overrides. Wi-Fi + secrets (wifi_ssid, wifi_password,
+  # ota_password, api_key) MUST be provided by the stub as substitutions, because
+  # a remote `packages:` include can't use !secret.
+  name: home-assistant-voice
   friendly_name: Home Assistant Voice
-  wifi_ssid: !secret wifi_ssid
-  wifi_password: !secret wifi_password
-  # (DHCP - no static IP. For a fixed IP, use home-assistant-voice.realtime.static-ip.yaml.)
-  # --- end identity + Wi-Fi ---
 
   # Phases of the Voice Assistant
   # The voice assistant is ready to be triggered by a wake word
@@ -62,11 +62,14 @@ substitutions:
   # (device→add-on WebSocket needs no auth token; it's a LAN-local service.)
 
 esphome:
-  # PERSONAL VARIANT: fixed name (matches your existing device for OTA) +
-  # no MAC suffix, driven by the substitutions above.
   name: ${name}
   friendly_name: ${friendly_name}
   name_add_mac_suffix: false
+  # Project identity drives the ESPHome dashboard "Update available" badge: bump
+  # `version` on a release (merge to main) and adopted devices are offered it.
+  project:
+    name: "xandervanerven.voice-pe-openai-realtime"
+    version: "1.0.0"
   min_version: 2026.5.0
   on_boot:
     priority: 375
@@ -167,9 +170,8 @@ logger:
 ota:
   - platform: esphome
     id: ota_esphome
-    # PERSONAL VARIANT: OTA upload password. Match your existing device's
-    # password so wireless updates keep working; define it in secrets.yaml.
-    password: !secret ota_password
+    # OTA upload password (from the stub's ota_password substitution -> secrets.yaml).
+    password: ${ota_password}
 
 # va-direct fork: api re-enabled so this device shows up in Home Assistant
 # again (entities, OTA discovery, and diagnostics readable from HA). Voice
@@ -179,7 +181,7 @@ ota:
 # mdns workaround is no longer needed.
 api:
   encryption:
-    key: !secret api_key
+    key: ${api_key}
   # va-direct: start micro_wake_word HERE (mirrors stock home-assistant-voice.yaml
   # and the fjfricke reference) instead of on_boot. Starting mWW at on_boot+1s
   # raced the XMOS voice-kit coming up, so mWW could begin reading a mic that
@@ -1858,22 +1860,15 @@ external_components:
     components:
       - voice_kit
     refresh: 0s
-  # va_client (OpenAI-realtime thin client) + udp_log live in this fork. They
-  # are pulled from GitHub so the config works as-is when pasted into the
-  # ESPHome Builder / dashboard without a local checkout.
-  #
-  # This repo is PRIVATE, so the URL carries a read-only token and is kept in
-  # secrets.yaml (gitignored — the token never lands in the committed config).
-  # Add to secrets.yaml:
-  #   va_components_repo: "https://<TOKEN>@github.com/xandervanerven/home-assistant-voice-pe.git"
-  # Use a GitHub fine-grained PAT scoped to this repo with Contents: read.
-  # (If you make the repo public, just use the plain https URL instead.)
-  # To iterate on the C++ locally, swap this for:
+  # va_client (the OpenAI-realtime thin client) lives in THIS repo. It is pulled
+  # from GitHub (public, no token) so the config builds without a local checkout.
+  # ref: main = the release branch; refresh: 0s = always fetch the latest C++.
+  # To iterate on the C++ locally instead, swap this for:
   #   - source: {type: local, path: esphome/components}
   - source:
       type: git
-      url: !secret va_components_repo
-      ref: dev
+      url: https://github.com/xandervanerven/home-assistant-voice-pe
+      ref: main
     components: [va_client]
     refresh: 0s
 
