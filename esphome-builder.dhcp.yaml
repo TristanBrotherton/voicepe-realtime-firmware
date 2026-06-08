@@ -1,5 +1,7 @@
 # ============================================================================
-# Per-device stub for the OpenAI Realtime Voice PE firmware.
+# Per-device stub for the OpenAI Realtime Voice PE firmware -- DEV CHANNEL.
+# Tracks the repo's `dev` branch (WIP) + the dev add-on on port 8081. For the
+# stable channel, use the @main stubs on the `main` branch instead.
 #
 # Copy THIS into your ESPHome dashboard ONCE (add/adopt the device, then edit its
 # YAML). It pulls the full firmware from this repo as a remote `packages:` include,
@@ -19,12 +21,14 @@ substitutions:
   wifi_password: !secret wifi_password
   ota_password: !secret ota_password
   api_key: !secret api_key
+  # DEV channel: talk to the dev add-on (port 8081), not stable (8080).
+  va_url: "ws://homeassistant.local:8081/"
 
 packages:
-  realtime: github://xandervanerven/home-assistant-voice-pe/home-assistant-voice.realtime.yaml@main
+  realtime: github://xandervanerven/home-assistant-voice-pe/home-assistant-voice.realtime.yaml@dev
 
 dashboard_import:
-  package_import_url: github://xandervanerven/home-assistant-voice-pe/home-assistant-voice.realtime.yaml@main
+  package_import_url: github://xandervanerven/home-assistant-voice-pe/home-assistant-voice.realtime.yaml@dev
   import_full_config: false
 
 # --- Fixed (static) IP? -----------------------------------------------------

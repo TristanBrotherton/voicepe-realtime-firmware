@@ -1862,13 +1862,14 @@ external_components:
     refresh: 0s
   # va_client (the OpenAI-realtime thin client) lives in THIS repo. It is pulled
   # from GitHub (public, no token) so the config builds without a local checkout.
-  # ref: main = the release branch; refresh: 0s = always fetch the latest C++.
-  # To iterate on the C++ locally instead, swap this for:
+  # ref selects the channel (main = stable, dev = WIP); refresh: 0s = always
+  # fetch the latest C++ for that ref. To iterate on the C++ locally instead,
+  # swap this for:
   #   - source: {type: local, path: esphome/components}
   - source:
       type: git
       url: https://github.com/xandervanerven/home-assistant-voice-pe
-      ref: main
+      ref: dev
     components: [va_client]
     refresh: 0s
 
