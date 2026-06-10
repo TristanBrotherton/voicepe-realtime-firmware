@@ -345,7 +345,24 @@ switch:
             binary_sensor.is_off: hardware_mute_switch
           then:
             - microphone.unmute:
+    # on_turn_on fires on EVERY off->on transition of the combined mute state —
+    # both the HA software toggle and the physical side switch (the template
+    # lambda republishes when hardware_mute_switch flips), so the session
+    # cut-off below covers both paths.
     on_turn_on:
+      # Muting must also END an active LISTENING session (the wake window or
+      # the post-reply follow-up window): the mic gate would otherwise stay
+      # open streaming dead air, with the ring stuck on "listening" until a
+      # watchdog expires. A reply that's currently PLAYING is left alone on
+      # purpose — mute silences the microphone, not the speaker.
+      - if:
+          condition:
+            lambda: |-
+              return id(voice_assistant_phase) == ${voice_assist_waiting_for_command_phase_id} ||
+                     id(voice_assistant_phase) == ${voice_assist_listening_for_command_phase_id};
+          then:
+            - lambda: 'id(va)->send_interrupt();'
+            - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
       - script.execute: control_leds
     on_turn_off:
       - script.execute: control_leds
@@ -844,30 +861,21 @@ light:
           name: "Muted or Silent"
           update_interval: 16ms
           lambda: |-
-            static int8_t index = 0;
+            // va-direct: stock painted the ambient led_ring colour as the base
+            // here, but next to our blue idle Active Pulse that reads as
+            // "still on" (reported: mute showed red dots while the blue ring
+            // stayed lit). Muted/silent = ring DARK with only the red markers:
+            // it[3]/it[9] (next to the mics) for mute, it[6] for volume-0.
             Color muted_color(255, 0, 0);
-            auto light_color = id(led_ring).current_values;
-            Color color(light_color.get_red() * 255, light_color.get_green() * 255,
-                  light_color.get_blue() * 255);
             for (uint8_t i = 0; i < 12; i++) {
-              if ( light_color.get_state() ) {
-                it[i] = color;
-              } else {
-                it[i] = Color::BLACK;
-              }
+              it[i] = Color::BLACK;
             }
             if ( id(master_mute_switch).state ) {
-              it[2] = Color::BLACK;
               it[3] = muted_color;
-              it[4] = Color::BLACK;
-              it[8] = Color::BLACK;
               it[9] = muted_color;
-              it[10] = Color::BLACK;
             }
             if ( id(external_media_player).volume == 0.0f || id(external_media_player).is_muted() ) {
-              it[5] = Color::BLACK;
               it[6] = muted_color;
-              it[7] = Color::BLACK;
             }
       - addressable_lambda:
           name: "Voice kit startup failed"
