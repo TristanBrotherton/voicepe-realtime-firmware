@@ -28,8 +28,17 @@ substitutions:
   # DEV channel: talk to the dev add-on (port 8081), not stable (8080).
   va_url: "ws://homeassistant.local:8081/"
 
+# Long form ON PURPOSE: the github:// shorthand has no refresh option, and
+# ESPHome then caches the remote yaml for a DAY — recompiles silently build
+# yesterday's dev config (only the va_client C++ stayed fresh, via its own
+# refresh: 0s). refresh: 0s re-fetches on every compile — exactly what a dev
+# channel needs.
 packages:
-  realtime: github://xandervanerven/home-assistant-voice-pe/home-assistant-voice.realtime.yaml@dev
+  realtime:
+    url: https://github.com/xandervanerven/home-assistant-voice-pe
+    ref: dev
+    files: [home-assistant-voice.realtime.yaml]
+    refresh: 0s
   # Merge a manual_ip block into the firmware's wifi: config for a fixed IP:
   static_ip:
     wifi:
