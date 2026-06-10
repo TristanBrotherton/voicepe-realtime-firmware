@@ -2054,7 +2054,23 @@ micro_wake_word:
     - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
       id: stop
       internal: true
+      # The model ships with cutoff 0.5. Real "stop"s during a reply scored a
+      # sliding-avg of only 0.62-0.67 (device logs), and in the quiet follow-up
+      # window — XMOS AGC still recovering from the TTS playback level — they
+      # stayed UNDER 0.5 and were missed without a trace, so the open mic
+      # streamed the word to OpenAI, which answered it as a turn. 0.4 buys
+      # detection margin; the false-accept exposure is contained because "stop"
+      # is only armed during replies + the follow-up window (~20 s per turn).
+      # TUNING KNOB: lower if stops still get missed, raise if it false-fires.
+      probability_cutoff: 0.4
+  # Permissive VAD gate. With the default threshold the VAD model repeatedly
+  # vetoed REAL stop detections — device log shows "Wake word model predicts
+  # 'Stop', but VAD model doesn't" 3x in a row before finally accepting
+  # (+1.5 s latency, long enough for OpenAI to win the turn race during the
+  # follow-up window). Keep the gate (it still blocks non-speech noise
+  # triggers for "alexa") but make it easier to satisfy.
   vad:
+    probability_cutoff: 0.3
   on_wake_word_detected:
     # TEMP DEBUG (va-direct): log EVERY detection BEFORE the mute guard, so the
     # next flash's log tells "mWW never fired" (mic/XMOS problem) apart from
