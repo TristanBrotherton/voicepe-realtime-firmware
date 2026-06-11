@@ -118,8 +118,15 @@ class VaClient : public Component {
   // uptime before declaring "we're properly back" and re-arming the chime.
   static constexpr uint32_t kStableConnectionMs = 30000;
 
-  // Scratch buffers reused on the hot path to avoid per-callback heap allocation.
+  // Scratch buffers reused on the hot paths to avoid per-callback heap
+  // allocation. Each is OWNED BY ONE TASK — never share them across tasks:
+  //   mono_buf_  — mic task only (on_mic_data_): i2s stereo-int32 → mono-int16.
+  //   tts_buf_   — WS task only (handle_binary_): TTS volume-scaling scratch.
+  // They used to be one shared vector; the mic task kept refilling it while
+  // the WS task scaled TTS through it → cross-task realloc/write races that
+  // dropped garbage samples into the playback ring (audible as hiss).
   std::vector<int16_t> mono_buf_;
+  std::vector<int16_t> tts_buf_;
 
   // Mic pre-roll ring (int16 mono @ kMicSampleRate), allocated in PSRAM. The
   // rolling ring continuously retains the most recent kPreRollMs of mic audio

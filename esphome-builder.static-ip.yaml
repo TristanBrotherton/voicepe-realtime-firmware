@@ -28,8 +28,16 @@ substitutions:
   dns1: !secret dns1
   dns2: !secret dns2
 
+# Long form ON PURPOSE: the github:// shorthand has no refresh option, and
+# ESPHome then caches the downloaded yaml for a DAY -- clicking Update right
+# after a release could silently rebuild yesterday's code. refresh: 0s makes
+# every compile fetch the latest release.
 packages:
-  realtime: github://xandervanerven/home-assistant-voice-pe/home-assistant-voice.realtime.yaml@main
+  realtime:
+    url: https://github.com/xandervanerven/home-assistant-voice-pe
+    ref: main
+    files: [home-assistant-voice.realtime.yaml]
+    refresh: 0s
   # Merge a manual_ip block into the firmware's wifi: config for a fixed IP:
   static_ip:
     wifi:

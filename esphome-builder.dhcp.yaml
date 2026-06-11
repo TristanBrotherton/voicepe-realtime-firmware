@@ -20,8 +20,16 @@ substitutions:
   ota_password: !secret ota_password
   api_key: !secret api_key
 
+# Long form ON PURPOSE: the github:// shorthand has no refresh option, and
+# ESPHome then caches the downloaded yaml for a DAY -- clicking Update right
+# after a release could silently rebuild yesterday's code. refresh: 0s makes
+# every compile fetch the latest release.
 packages:
-  realtime: github://xandervanerven/home-assistant-voice-pe/home-assistant-voice.realtime.yaml@main
+  realtime:
+    url: https://github.com/xandervanerven/home-assistant-voice-pe
+    ref: main
+    files: [home-assistant-voice.realtime.yaml]
+    refresh: 0s
 
 dashboard_import:
   package_import_url: github://xandervanerven/home-assistant-voice-pe/home-assistant-voice.realtime.yaml@main

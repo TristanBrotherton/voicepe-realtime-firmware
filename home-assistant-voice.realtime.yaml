@@ -69,7 +69,7 @@ esphome:
   # `version` on a release (merge to main) and adopted devices are offered it.
   project:
     name: "xandervanerven.voice-pe-openai-realtime"
-    version: "1.0.0"
+    version: "1.1.0"
   min_version: 2026.5.0
   on_boot:
     priority: 375
@@ -345,7 +345,24 @@ switch:
             binary_sensor.is_off: hardware_mute_switch
           then:
             - microphone.unmute:
+    # on_turn_on fires on EVERY off->on transition of the combined mute state —
+    # both the HA software toggle and the physical side switch (the template
+    # lambda republishes when hardware_mute_switch flips), so the session
+    # cut-off below covers both paths.
     on_turn_on:
+      # Muting must also END an active LISTENING session (the wake window or
+      # the post-reply follow-up window): the mic gate would otherwise stay
+      # open streaming dead air, with the ring stuck on "listening" until a
+      # watchdog expires. A reply that's currently PLAYING is left alone on
+      # purpose — mute silences the microphone, not the speaker.
+      - if:
+          condition:
+            lambda: |-
+              return id(voice_assistant_phase) == ${voice_assist_waiting_for_command_phase_id} ||
+                     id(voice_assistant_phase) == ${voice_assist_listening_for_command_phase_id};
+          then:
+            - lambda: 'id(va)->send_interrupt();'
+            - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
       - script.execute: control_leds
     on_turn_off:
       - script.execute: control_leds
@@ -844,30 +861,21 @@ light:
           name: "Muted or Silent"
           update_interval: 16ms
           lambda: |-
-            static int8_t index = 0;
+            // va-direct: stock painted the ambient led_ring colour as the base
+            // here, but next to our blue idle Active Pulse that reads as
+            // "still on" (reported: mute showed red dots while the blue ring
+            // stayed lit). Muted/silent = ring DARK with only the red markers:
+            // it[3]/it[9] (next to the mics) for mute, it[6] for volume-0.
             Color muted_color(255, 0, 0);
-            auto light_color = id(led_ring).current_values;
-            Color color(light_color.get_red() * 255, light_color.get_green() * 255,
-                  light_color.get_blue() * 255);
             for (uint8_t i = 0; i < 12; i++) {
-              if ( light_color.get_state() ) {
-                it[i] = color;
-              } else {
-                it[i] = Color::BLACK;
-              }
+              it[i] = Color::BLACK;
             }
             if ( id(master_mute_switch).state ) {
-              it[2] = Color::BLACK;
               it[3] = muted_color;
-              it[4] = Color::BLACK;
-              it[8] = Color::BLACK;
               it[9] = muted_color;
-              it[10] = Color::BLACK;
             }
             if ( id(external_media_player).volume == 0.0f || id(external_media_player).is_muted() ) {
-              it[5] = Color::BLACK;
               it[6] = muted_color;
-              it[7] = Color::BLACK;
             }
       - addressable_lambda:
           name: "Voice kit startup failed"
@@ -1133,6 +1141,15 @@ light:
     icon: "mdi:circle-outline"
     default_transition_length: 0ms
     restore_mode: RESTORE_DEFAULT_OFF
+    # Re-render the device LEDs when this entity is toggled from HA: the idle
+    # "Active Pulse" is gated on this light's state, and without a refresh the
+    # running effect would keep overwriting the strip until the next phase
+    # change. on_turn_on/off only fire on real transitions, so the re-assert
+    # inside control_leds (turn_on while already on) can't loop back here.
+    on_turn_on:
+      - script.execute: control_leds
+    on_turn_off:
+      - script.execute: control_leds
     initial_state:
       color_mode: rgb
       brightness: 66%
@@ -1320,11 +1337,18 @@ script:
     then:
       # va-direct: when the va_client WebSocket is connected, show a gentle blue
       # breathing pulse at idle so there's a visible "ready" state (as the user
-      # wants, like the reference firmware). When the WS is down, keep the stock
-      # behaviour: ring off unless the user manually turned on the led_ring light.
+      # wants, like the reference firmware) — but ONLY while the user-facing
+      # "LED Ring" light entity is ON. The pulse used to ignore that entity's
+      # on/off state (it only read its brightness), and since the effect
+      # re-renders every 50 ms it instantly overwrote any turn-off coming from
+      # HA — the HA switch appeared broken. Entity off = device dark at rest,
+      # like stock. When the WS is down, keep the stock behaviour too: ring off
+      # unless the user manually turned on the led_ring light.
       - if:
           condition:
-            lambda: 'return id(va)->is_connected();'
+            and:
+              - lambda: 'return id(va)->is_connected();'
+              - light.is_on: led_ring
           then:
             - light.turn_on:
                 id: voice_assistant_leds
@@ -1634,25 +1658,30 @@ script:
   # on_phase handler (enable on phase=replying, disable otherwise).
   # Kept for diff readability with upstream; safe to delete once the
   # va-direct yaml is the only one.
-  # Watchdog for va_client follow-up windows: if the user stays silent
-  # during a request_follow_up window, va_client closes the mic at
-  # kRequestFollowUpMs (10 s) but doesn't notify yaml. Without this script
-  # the LED would stay in listening_for_command forever and the `stop`
-  # model would never disarm. mode: restart so a new follow-up cancels
-  # the previous timer.
+  # Single disarm point for the "stop" wake word. Started on EVERY return to idle
+  # (on_phase) and by on_followup_opened (request_follow_up). It waits out the
+  # whole reply tail + follow-up listening window, then disarms "stop" — but only
+  # if no new turn started meanwhile (a new reply OR a `listening` turn-start
+  # calls script.stop on this; the turn's own return to idle restarts it).
+  # mode: restart so each idle / follow-up restarts the timer.
   #
-  # Total wait = kFollowupOpenDelayMs (1500ms drain wait before mic opens)
-  # + kRequestFollowUpMs (10000ms mic-open window) + 500ms buffer.
+  # 12 s comfortably covers both window types: the automatic follow-up
+  # (follow_up_listen_seconds, ~8 s) and a request_follow_up (kRequestFollowUpMs,
+  # ~10 s) plus the mic-open delay + buffer. In the gap between the window closing
+  # and this firing, "stop" stays armed but is a harmless no-op at idle.
   - id: followup_window_watchdog
     mode: restart
     then:
       - delay: 12000ms
-      # If we're still in listening (user never spoke / server never moved
-      # past listening_for_command), the follow-up timed out silently.
-      # Disarm stop and drop the LED back to idle.
+      # Still at rest (idle) or still in the listening window (user never spoke)?
+      # Then the turn + its follow-up are over — disarm stop and settle on idle.
+      # If a new reply started, phase is replying/thinking here, so we leave stop
+      # armed (and this watchdog was also cancelled on "replying").
       - if:
           condition:
-            lambda: 'return id(voice_assistant_phase) == ${voice_assist_listening_for_command_phase_id};'
+            lambda: |-
+              return id(voice_assistant_phase) == ${voice_assist_idle_phase_id} ||
+                     id(voice_assistant_phase) == ${voice_assist_listening_for_command_phase_id};
           then:
             - micro_wake_word.disable_model: stop
             - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
@@ -1862,8 +1891,9 @@ external_components:
     refresh: 0s
   # va_client (the OpenAI-realtime thin client) lives in THIS repo. It is pulled
   # from GitHub (public, no token) so the config builds without a local checkout.
-  # ref: main = the release branch; refresh: 0s = always fetch the latest C++.
-  # To iterate on the C++ locally instead, swap this for:
+  # ref selects the channel (main = stable, dev = WIP); refresh: 0s = always
+  # fetch the latest C++ for that ref. To iterate on the C++ locally instead,
+  # swap this for:
   #   - source: {type: local, path: esphome/components}
   - source:
       type: git
@@ -1932,27 +1962,49 @@ va_client:
           lambda: 'return phase == "idle";'
         then:
           - micro_wake_word.start:
-    # Arm the "stop" wake word for the WHOLE reply, not per phase-transition.
-    # The backend's phase flaps replying<->thinking DURING a single reply (the
-    # device keeps draining TTS through those "thinking" flaps — see the logs:
-    # replying -> thinking 1s in, then idle 12s later). The old
-    # disarm-on-every-non-replying `else` branch therefore switched "stop" OFF
-    # for most of each reply, so the user's "stop" was almost always ignored.
-    # Mirror stock's activate_stop_word_once: ENABLE on the first "replying" and
-    # DISABLE only when the turn fully ends ("idle"); leave listening/thinking in
-    # between untouched so the model stays armed across the flaps. (Detection
-    # over the device's own TTS is still AEC-limited, but at least it's now
-    # actually listening for the whole reply.)
+    # Arm "stop" for the WHOLE reply AND through the follow-up listening window —
+    # not just while the backend says "replying". Two reasons:
+    #  1) The backend bursts the reply; the device keeps playing the audio TAIL
+    #     for a moment AFTER "idle", and the phase flaps replying<->thinking
+    #     mid-reply. So we arm on "replying" and never disarm on those flaps.
+    #  2) After every reply the device opens an automatic follow-up listening
+    #     window (mic on). The user must be able to say "stop" during that window
+    #     too. So we do NOT disarm on "idle" — that used to leave a dead gap over
+    #     the tail + the whole follow-up window (the reported "stop doesn't work
+    #     when it goes back to listening"). The disarm is handed to
+    #     followup_window_watchdog, which fires only once the device has truly
+    #     gone to rest (window expired, no new reply). A new reply cancels that
+    #     watchdog and re-arms. Mirrors stock's "arm while audio plays", extended
+    #     across our follow-up window.
     - if:
         condition:
           lambda: 'return phase == "replying";'
         then:
           - micro_wake_word.enable_model: stop
+          - script.stop: followup_window_watchdog
+    # A turn is in flight ("listening" = the server VAD heard the user speak,
+    # OR the follow-up window just opened its listening LED): stop the disarm
+    # watchdog that the preceding idle started. Without this it fires 12 s
+    # after that idle — mid-turn if the user is still talking — and its
+    # idle-or-listening condition matches, forcing phase/LED to idle and
+    # disarming "stop" in the middle of the conversation. Stopping it here
+    # also decouples the 12 s constant from follow_up_listen_seconds (windows
+    # > ~11 s no longer get cut short). Every path still converges on a
+    # disarm: each return to idle (incl. the window-expiry idle the firmware
+    # fires) restarts the watchdog. The request_follow_up path is unaffected —
+    # it sets the phase global directly (not via on_phase) and runs its own
+    # watchdog from on_followup_opened.
+    - if:
+        condition:
+          lambda: 'return phase == "listening";'
+        then:
+          - script.stop: followup_window_watchdog
     - if:
         condition:
           lambda: 'return phase == "idle";'
         then:
-          - micro_wake_word.disable_model: stop
+          - micro_wake_word.enable_model: stop
+          - script.execute: followup_window_watchdog
   on_repeated_failure:
     # Backend has been unreachable for N reconnect attempts in a row.
     # Play the error chime once so the user knows something's wrong —
@@ -1987,9 +2039,15 @@ va_client:
                   media_player.is_announcing:
                     id: external_media_player
               timeout: 2s
-          # i2s_audio_speaker ring tail — same 400 ms used on the wake
-          # path. Mic stays closed until this delay completes.
-          - delay: 400ms
+          # i2s_audio_speaker ring tail + room-echo decay. The wake path gets
+          # away with 400 ms because the user speaks right after the chime and
+          # any leaked tail merges into their turn; here the user typically
+          # pauses ~1 s first, so a chime echo that survives the XMOS AEC
+          # (~10x leak) arrives ALONE — the server VAD calls it a turn, the
+          # silence after it commits, and the user's real answer then lands
+          # mid-response. 800 ms lets the echo decay before the mic opens.
+          # (Adopted from upstream maxmaxme 38be9c8, same reasoning verified.)
+          - delay: 800ms
     - lambda: 'id(va)->commit_followup_mic();'
     - lambda: id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
     - script.execute: control_leds
@@ -2026,7 +2084,23 @@ micro_wake_word:
     - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
       id: stop
       internal: true
+      # The model ships with cutoff 0.5. Real "stop"s during a reply scored a
+      # sliding-avg of only 0.62-0.67 (device logs), and in the quiet follow-up
+      # window — XMOS AGC still recovering from the TTS playback level — they
+      # stayed UNDER 0.5 and were missed without a trace, so the open mic
+      # streamed the word to OpenAI, which answered it as a turn. 0.4 buys
+      # detection margin; the false-accept exposure is contained because "stop"
+      # is only armed during replies + the follow-up window (~20 s per turn).
+      # TUNING KNOB: lower if stops still get missed, raise if it false-fires.
+      probability_cutoff: 0.4
+  # Permissive VAD gate. With the default threshold the VAD model repeatedly
+  # vetoed REAL stop detections — device log shows "Wake word model predicts
+  # 'Stop', but VAD model doesn't" 3x in a row before finally accepting
+  # (+1.5 s latency, long enough for OpenAI to win the turn race during the
+  # follow-up window). Keep the gate (it still blocks non-speech noise
+  # triggers for "alexa") but make it easier to satisfy.
   vad:
+    probability_cutoff: 0.3
   on_wake_word_detected:
     # TEMP DEBUG (va-direct): log EVERY detection BEFORE the mute guard, so the
     # next flash's log tells "mWW never fired" (mic/XMOS problem) apart from
