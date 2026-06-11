@@ -69,7 +69,7 @@ esphome:
   # `version` on a release (merge to main) and adopted devices are offered it.
   project:
     name: "xandervanerven.voice-pe-openai-realtime"
-    version: "1.0.0"
+    version: "1.1.0"
   min_version: 2026.5.0
   on_boot:
     priority: 375
