@@ -1687,29 +1687,8 @@ script:
             - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
             - script.execute: control_leds
 
-  - id: activate_stop_word_once
-    then:
-      - wait_until:
-          condition:
-            media_player.is_announcing:
-              id: external_media_player
-          timeout: 5s
-      - delay: 1s
-      # Enable stop wake word
-      - if:
-          condition:
-            switch.is_off: timer_ringing
-          then:
-            - micro_wake_word.enable_model: stop
-            - wait_until:
-                not:
-                  media_player.is_announcing:
-                    id: external_media_player
-            - if:
-                condition:
-                  switch.is_off: timer_ringing
-                then:
-                  - micro_wake_word.disable_model: stop
+  # (Removed: stock's `activate_stop_word_once` script — orphaned in this fork.
+  # "stop" arming is owned by va_client's on_phase + followup_window_watchdog.)
 
 i2s_audio:
   - id: i2s_output

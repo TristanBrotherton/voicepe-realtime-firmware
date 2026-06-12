@@ -4,6 +4,7 @@
 #include "esphome/components/microphone/microphone.h"
 #include "esphome/components/speaker/speaker.h"
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -100,7 +101,15 @@ class VaClient : public Component {
   // guard we'd double-bump the backoff delay and double-log.
   bool reconnect_pending_{false};
 
-  std::string current_phase_{"idle"};
+  // Server-driven phase, stored as an atomic enum. set_phase_ WRITES it on
+  // the WS task while start_session() (main loop) READS it for the residual-
+  // reply check — as a std::string that was a cross-task data race (benign in
+  // practice thanks to SSO, but UB). The yaml trigger path still receives the
+  // phase as a string parameter; only this cross-task state is an enum.
+  enum class Phase : uint8_t { IDLE = 0, LISTENING, THINKING, REPLYING };
+  static Phase phase_from_string_(const std::string &phase);
+  static const char *phase_name_(Phase p);
+  std::atomic<uint8_t> current_phase_{static_cast<uint8_t>(Phase::IDLE)};
   std::vector<OnPhaseTrigger *> phase_triggers_;
   std::vector<OnRepeatedFailureTrigger *> repeated_failure_triggers_;
   std::vector<OnFollowupOpenedTrigger *> followup_opened_triggers_;
