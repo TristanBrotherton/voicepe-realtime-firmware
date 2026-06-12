@@ -85,8 +85,8 @@ known-good starting point — you can fine-tune later:
 | `transcription_language` | blank (set your ISO code, e.g. `nl`, to log what it heard) |
 | `transcription_model` | `gpt-4o-transcribe` |
 | `follow_up_listen_seconds` | `8` |
-| `follow_up_open_delay_ms` | `0` |
-| `playback_prebuffer_ms` | `0` |
+| `follow_up_open_delay_ms` | `700` |
+| `playback_prebuffer_ms` | `150` |
 | `max_context_messages` | `12` |
 | `mcp_tool_allowlist` | **blank** (use all of the official server's tools — it's already a small set) |
 | `enable_web_search` | `true` (online lookups on by default; set `false` to disable) |
@@ -202,8 +202,9 @@ are **never** overwritten by an update.
 
 ## Part 5 — Tuning tips
 
-- **It hears its own tail** (a stray turn right after a reply): raise
-  `follow_up_open_delay_ms` to ~200.
+- **It hears its own tail** (a stray turn right after a reply, or it repeats
+  its last answer): the default `follow_up_open_delay_ms` of `700` normally
+  prevents this — raise it further (~1000) if it still happens.
 - **Crackle at the start of a reply:** raise `playback_prebuffer_ms` to ~150.
 - **See what it understood:** set `transcription_language` to your ISO code (e.g. `nl`)
   → the add-on log gains `🗣️ user: …` lines.
