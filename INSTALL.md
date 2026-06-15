@@ -69,22 +69,28 @@ that's what lets the voice turn your lights, switches, scenes and climate on and
 
 ### 1.4 Recommended starting settings
 
-**The defaults are the recommended settings.** The Configuration tab is grouped
-(🔑 Basics → 🗣️ Model & voice → 💬 Conversation → 🌐 Web search → 🎚️ Audio →
-🏠 Home Assistant → ⚙️ Advanced → 🔍 Debug), every option has plain-language
-inline help, and a full Dutch translation shows automatically when your HA is
-set to Dutch. For a first run you only need to set:
+Set these on the **Configuration** tab (each option has inline help text). This is a
+known-good starting point — you can fine-tune later:
 
 | Option | Value |
 |---|---|
-| `OpenAI API key` | your key (Part 1.2) |
-| `Spoken language` | your ISO code, e.g. `nl` (locks the language + logs what it heard) |
-| `Assistant personality` | the English default works; to change language, see Part 5 |
-
-Worth knowing: `marin` and `cedar` are the most natural voices; the follow-up
-mic delay (200 ms) and playback buffer (150 ms) defaults keep ghost triggers
-and crackle away; rarely-needed expert fields stay hidden until you enable
-"Show unused optional configuration options" at the bottom of the form.
+| `openai_model` | `gpt-realtime-2` |
+| `openai_voice` | `marin` (or `cedar`) |
+| `openai_speed` | `1.0` |
+| `max_output_tokens` | `0` (unlimited) |
+| `noise_reduction` | `off` |
+| `vad_eagerness` | `low` |
+| `transcription_language` | blank (set your ISO code, e.g. `nl`, to log what it heard) |
+| `transcription_model` | `gpt-4o-transcribe` |
+| `follow_up_listen_seconds` | `8` |
+| `follow_up_open_delay_ms` | `700` |
+| `wake_open_delay_ms` | `700` |
+| `playback_prebuffer_ms` | `150` |
+| `max_context_messages` | `12` |
+| `mcp_tool_allowlist` | **blank** (use all of the official server's tools — it's already a small set) |
+| `enable_web_search` | `true` (online lookups on by default; set `false` to disable) |
+| `web_search_model` | `gpt-5.5` (best quality; mini/nano are cheaper) |
+| `instructions` | the English default (to change language, see Part 5) |
 
 ### 1.5 Start it
 
@@ -195,9 +201,11 @@ are **never** overwritten by an update.
 
 ## Part 5 — Tuning tips
 
-- **It hears its own tail** (a stray turn right after a reply): raise
-  `follow_up_open_delay_ms` to ~200.
-- **Crackle at the start of a reply:** raise `playback_prebuffer_ms` to ~150.
+- **It hears its own tail** (a stray turn right after a reply, or it repeats
+  its last answer): the default `follow_up_open_delay_ms` of `700` normally
+  prevents this — raise it further (~1000) if it still happens.
+- **Crackle at the start of a reply:** raise `playback_prebuffer_ms` above the
+  default 150 (e.g. ~250).
 - **See what it understood:** set `transcription_language` to your ISO code (e.g. `nl`)
   → the add-on log gains `🗣️ user: …` lines.
 - **Web search:** it answers weather / news / facts online out of the box

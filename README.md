@@ -63,6 +63,18 @@ After that, when a new firmware version is released the dashboard shows
 **"Update available"** for the device — click it to pull the latest config and
 re-flash. No more copy-pasting.
 
+## Known limitations
+
+- **No voice timers or alarms yet** — every other Assist action (lights, switches,
+  scenes, climate) and online questions work.
+- **A brief reconnect about once an hour** (OpenAI's 60-minute session cap; the
+  add-on refreshes proactively during a quiet moment, so it rarely interrupts).
+- **Rarely, the assistant may stop itself** on a word in its own reply that sounds
+  like "stop" — just ask again.
+- **Using "stop":** interrupts the assistant *while it's speaking* (during a reply
+  or the short listening window right after one); it has no effect before it has
+  started answering.
+
 ---
 
 Based on the ESPHome source of the [Home Assistant Voice: Preview Edition](https://www.home-assistant.io/voice-pe/).

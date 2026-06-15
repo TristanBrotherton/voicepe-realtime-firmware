@@ -270,8 +270,14 @@ void VaClient::loop() {
 
 void VaClient::connect_() {
   if (this->ws_handle_ != nullptr) {
-    // Already initialised; just (re)start.
-    esp_websocket_client_start(static_cast<esp_websocket_client_handle_t>(this->ws_handle_));
+    // Already initialised; just (re)start. A synchronous start failure must
+    // reschedule — otherwise the reconnect chain stalls silently and the
+    // device stays offline until a reboot.
+    esp_err_t err = esp_websocket_client_start(static_cast<esp_websocket_client_handle_t>(this->ws_handle_));
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "esp_websocket_client_start (restart) failed: %d — rescheduling", (int) err);
+      this->schedule_reconnect_();
+    }
     return;
   }
 
@@ -455,6 +461,12 @@ void VaClient::handle_text_(const char *data, size_t len) {
         v = kFollowupOpenDelayMaxMs;
       this->followup_open_delay_ms_ = v;
       ESP_LOGI(TAG, "hello: follow-up mic-open delay = %u ms", (unsigned) v);
+    }
+    if (parse_uint_after_key(msg, "\"wake_open_delay_ms\":", v)) {
+      if (v > kFollowupOpenDelayMaxMs)  // reuse the same 5 s ceiling
+        v = kFollowupOpenDelayMaxMs;
+      this->wake_open_delay_ms_ = v;
+      ESP_LOGI(TAG, "hello: wake mic-open delay = %u ms", (unsigned) v);
     }
     if (parse_uint_after_key(msg, "\"playback_prebuffer_ms\":", v)) {
       if (v > kPlaybackPrebufferMaxMs)
@@ -672,21 +684,66 @@ void VaClient::preroll_push_(const int16_t *data, size_t n) {
   }
 }
 
+VaClient::Phase VaClient::phase_from_string_(const std::string &phase) {
+  if (phase == "listening")
+    return Phase::LISTENING;
+  if (phase == "thinking")
+    return Phase::THINKING;
+  if (phase == "replying")
+    return Phase::REPLYING;
+  return Phase::IDLE;
+}
+
+const char *VaClient::phase_name_(Phase p) {
+  switch (p) {
+    case Phase::LISTENING:
+      return "listening";
+    case Phase::THINKING:
+      return "thinking";
+    case Phase::REPLYING:
+      return "replying";
+    default:
+      return "idle";
+  }
+}
+
 void VaClient::set_phase_(const std::string &phase) {
   // Don't dedupe — we want yaml-side control_leds to re-render even on
   // identical phase if other inputs (e.g. va WS connection state) have
   // changed since the last emission.
-  const std::string prev_phase = this->current_phase_;
-  this->current_phase_ = phase;
+  const Phase prev = static_cast<Phase>(this->current_phase_.load());
+  this->current_phase_.store(static_cast<uint8_t>(phase_from_string_(phase)));
   ESP_LOGD(TAG, "Phase -> %s", phase.c_str());
 
-  // Lift the post-"stop" incoming-audio suppression once the backend confirms a
-  // turn boundary: "idle" (the cancelled reply truly ended) or "listening" (a
-  // fresh turn's audio is now legitimate). We deliberately do NOT clear on
+  // Post-stop `thinking` guard. After a local "stop" the mic gate is closed
+  // (send_interrupt set post_stop_guard_), so no new turn can begin until a
+  // wake (start_session clears it). A `thinking` arriving here is the server
+  // VAD's end-of-turn for the utterance we just cancelled — acting on it
+  // strands the LED in `thinking` until the backend's 15 s watchdog (observed
+  // 2026-06-14: "stop" mid-question -> 15 s stuck thinking). Ignore it, keeping
+  // the prior phase. Scoped to `thinking`: a web search's replying->thinking
+  // has no stop (guard stays false), and a reply-drain emits no `thinking`.
+  if (this->post_stop_guard_ && phase == "thinking") {
+    this->current_phase_.store(static_cast<uint8_t>(prev));  // don't advance to the stale value
+    ESP_LOGI(TAG, "ignoring stale 'thinking' after stop (no wake since)");
+    return;
+  }
+
+  // Lift the post-"stop" incoming-audio suppression ONLY on "listening" — a
+  // genuine fresh user turn whose reply is legitimate. We deliberately do NOT
+  // lift on "idle": the backend keeps streaming the cancelled reply's audio in
+  // real-time (OpenAI generated it faster than playback; a `response.cancel`
+  // after the response already finished is a no-op), so it can drain for many
+  // seconds AFTER the stop. An "idle" can arrive mid-drain — notably the
+  // backend's thinking-watchdog force-idle — and lifting suppression there
+  // un-mutes the still-arriving tail, which then plays as an "answer out of
+  // nowhere" (observed live 2026-06-13 10:11). A real next reply is always
+  // preceded by "listening" (the user speaks), so that stays the only safe
+  // gate; until then the tail keeps being dropped. We also do NOT clear on
   // "thinking"/"replying" — those can still belong to the reply we cancelled.
-  if (this->suppress_incoming_audio_ && (phase == "idle" || phase == "listening")) {
+  if (this->suppress_incoming_audio_ && phase == "listening") {
     this->suppress_incoming_audio_ = false;
-    ESP_LOGI(TAG, "incoming-audio suppression lifted on phase=%s", phase.c_str());
+    ESP_LOGI(TAG, "incoming-audio suppression lifted on phase=listening");
   }
 
   // Streaming gate state machine:
@@ -765,10 +822,33 @@ void VaClient::set_phase_(const std::string &phase) {
     // open the window for every spurious idle (initial WS hello, post-
     // disconnect idle, etc), spamming "follow-up window open" logs and
     // opening the mic for 5s every time the device just reconnects.
-    const bool turn_just_ended = prev_phase == "thinking" || prev_phase == "replying";
+    const bool turn_just_ended = prev == Phase::THINKING || prev == Phase::REPLYING;
     if (!turn_just_ended) {
       // Plain idle (boot, reconnect, etc) — no follow-up. Fall through to
       // the regular trigger fire so the LED updates.
+      //
+      // An idle that arrives while the mic gate is still OPEN means an orphaned
+      // stream that nothing else will close — shut it. Two real ways to reach
+      // here with streaming_ still true:
+      //   • idle straight from `listening`: the turn died without a reply (a
+      //     backend force-idle on rate-limit / thinking-watchdog — the backend
+      //     suppresses `thinking` after declaring a turn dead, so `listening`
+      //     is exactly where the device sits — or a WS drop mid-listening).
+      //   • idle from `idle` (prev==IDLE) with the mic open: the brief post-wake
+      //     "waiting for the first phase" window, or an open follow-up window,
+      //     when the WS drops (on_ws_event fires set_phase_("idle") on
+      //     disconnect). Without this the gate stays open and the mic resumes
+      //     streaming the room the instant we reconnect — and the backend's
+      //     mic-resume buffer clear can't help because the stream never paused.
+      // Closing here can't cut a LIVE follow-up window short: the only idle that
+      // reaches an open window is exactly such a disconnect — the backend sends
+      // no idle while it's waiting for the user to answer.
+      if (this->streaming_) {
+        ESP_LOGI(TAG, "idle while mic open (prev=%s) — closing orphaned mic gate",
+                 phase_name_(prev));
+        this->streaming_ = false;
+        this->cancel_timeout("va_no_speech");
+      }
     } else if (this->suppress_followup_) {
       // send_interrupt() set this — user explicitly asked us to stop.
       // Close the session cleanly: streaming off, no follow-up, fall through
@@ -782,9 +862,45 @@ void VaClient::set_phase_(const std::string &phase) {
       this->cancel_timeout("va_tts_tail");
       this->idle_emit_pending_ = false;
     } else if (this->audio_fill_ == 0) {
-      // Server says response.done and the device has actually played out.
-      // Open the follow-up window (mic on so user can answer a question).
-      this->open_followup_window_(this->followup_ms_);
+      // Stale-`idle` guard. prev==REPLYING with NO audio played since the last
+      // wake (turn_t_first_audio_out_==0) means this `idle` belongs to a reply
+      // that was stopped and then superseded by a new wake while it was still
+      // draining: start_session() reset turn_t_first_audio_out_ and the old
+      // tail is suppressed, so nothing actually played in THIS session. Opening
+      // a follow-up here lights a spurious `listening` window over the fresh
+      // wake session (observed live 2026-06-14: web-search → "stop" → bare wake
+      // → ~4 s `listening` flicker; device log "Phase -> idle (was replying)").
+      // Ignore it: the wake's no-speech watchdog is still armed (we never
+      // reached `listening`, so it was never cancelled) and owns the session —
+      // it idles the LED and closes the mic. current_phase_ is already IDLE
+      // (set at the top of set_phase_), so the next message's `prev` is fine.
+      // Tight by construction: a reply that really played sets
+      // turn_t_first_audio_out_ (suppression lifts on `listening`), and a
+      // follow-up chain keeps it set (only start_session resets it), so no
+      // legitimate follow-up is skipped; the dead-turn path (prev==THINKING,
+      // watchdog already cancelled) is deliberately left untouched.
+      if (prev == Phase::REPLYING && this->turn_t_first_audio_out_ == 0) {
+        ESP_LOGI(TAG, "stale replying-idle after wake (no audio this session) "
+                      "— ignoring, no follow-up");
+        // Distinguished by the mic gate: streaming_==true is a BARE WAKE (mic
+        // still open, never reached `replying` this session) → the no-speech
+        // watchdog is armed and owns the idle + mic close, so leave the LED on
+        // the wake state. streaming_==false means the turn DID reach `replying`
+        // (mic gated) but the audio never played — e.g. suppress_incoming_audio_
+        // was still set from an earlier stop, so turn_t_first_audio_out_ stayed
+        // 0. The watchdog was cancelled when the turn reached `listening`, so
+        // nothing else fires idle → fall through to the LED trigger below, else
+        // the ring strands on `replying` (observed live 2026-06-14: rapid stops
+        // left suppression on, the search reply was dropped, the LED hung).
+        if (this->streaming_) {
+          return;  // bare wake: va_no_speech owns the idle + mic
+        }
+        // else: fall through to fire the idle LED (still no follow-up).
+      } else {
+        // Server says response.done and the device has actually played out.
+        // Open the follow-up window (mic on so user can answer a question).
+        this->open_followup_window_(this->followup_ms_);
+      }
       // fall through to fire the trigger normally below (LED -> idle); the
       // follow-up window, if any, fires its own `listening` LED after its delay.
     } else {
@@ -839,14 +955,15 @@ void VaClient::start_session() {
   // (response_cancel_not_active is in its benignCodes set), and
   // input_audio_buffer.clear is safe here because mic frames for the new turn
   // don't start flowing until after this function returns.
+  const Phase phase_now = static_cast<Phase>(this->current_phase_.load());
   const bool residual_reply =
       this->audio_fill_ > 0 ||
       this->idle_emit_pending_ ||
-      this->current_phase_ == "replying" ||
-      this->current_phase_ == "thinking";
+      phase_now == Phase::REPLYING ||
+      phase_now == Phase::THINKING;
   if (residual_reply) {
     ESP_LOGI(TAG, "start_session: interrupting residual reply (phase=%s, fill=%u)",
-             this->current_phase_.c_str(), (unsigned) this->audio_fill_);
+             phase_name_(phase_now), (unsigned) this->audio_fill_);
     this->send_interrupt();
   }
 
@@ -857,6 +974,11 @@ void VaClient::start_session() {
   this->preroll_discard_pending_ = true;
   ESP_LOGI(TAG, "start_session() — streaming on");
   this->streaming_ = true;
+  // Tell the backend a fresh wake started (dangling-VAD guard, A). Sent AFTER
+  // the residual-reply interrupt above so the backend sees interrupt → wake in
+  // order. The first real mic frame for this turn doesn't flow until after this
+  // returns, so the guard's "speech since wake" tracker starts clean.
+  this->send_wake_();
   // New wake word starts a fresh session — drop any pending or active
   // follow-up window from the previous turn.
   this->followup_pending_ = false;
@@ -865,6 +987,10 @@ void VaClient::start_session() {
   this->followup_armed_ = false;
   this->idle_emit_pending_ = false;
   this->suppress_followup_ = false;
+  // A genuine new turn starts here — drop the post-stop `thinking` guard so
+  // this turn's `thinking` shows normally. (Set last, AFTER the residual-reply
+  // send_interrupt() above re-set it, so the wake always ends with it clear.)
+  this->post_stop_guard_ = false;
   this->cancel_timeout("va_followup");
   this->cancel_timeout("va_followup_open");
   this->cancel_timeout("va_tts_tail");
@@ -965,6 +1091,14 @@ void VaClient::open_followup_window_(uint32_t duration_ms) {
   ESP_LOGI(TAG, "follow-up: mic opens in %u ms, then listening for %u ms",
            (unsigned) open_delay, (unsigned) duration_ms);
   this->set_timeout("va_followup_open", open_delay, [this, duration_ms]() {
+    if (!this->ws_connected_) {
+      // The reply drained into a dead connection (WS dropped mid-reply).
+      // Opening the mic would show a "listening" LED while on_mic_data_
+      // drops every frame — a window the user talks into for nothing.
+      // Leave the LED on idle; a fresh wake after reconnect starts clean.
+      ESP_LOGI(TAG, "follow-up window skipped — WS disconnected");
+      return;
+    }
     ESP_LOGI(TAG, "follow-up window open (mic on, listening for %u ms)", (unsigned) duration_ms);
     this->streaming_ = true;
     this->fire_phase_led_("listening");  // blue ring: user may answer now
@@ -972,10 +1106,43 @@ void VaClient::open_followup_window_(uint32_t duration_ms) {
       if (this->streaming_) {
         ESP_LOGI(TAG, "follow-up window expired — mic streaming off");
         this->streaming_ = false;
+        this->send_mic_flush_();        // drop any uncommitted partial utterance
         this->fire_phase_led_("idle");  // no answer came; back to idle
       }
     });
   });
+}
+
+void VaClient::send_mic_flush_() {
+  // The mic gate just closed mid-stream because a follow-up window timed out.
+  // If the user had started (but not finished) speaking, that audio sits
+  // UNCOMMITTED in OpenAI's input_audio_buffer; left there, a later wake's
+  // audio "completes" it and the model answers a stale half-sentence. Drop it
+  // NOW, at the cut-off, so no reactive clear-on-wake is needed (that disturbed
+  // the server VAD and caused garbage commits). This timer only fires when the
+  // user did NOT trigger speech — `listening` cancels va_followup — so it can
+  // never drop a valid command. Cheap no-op when the buffer was empty.
+  if (this->ws_connected_ && this->ws_handle_ != nullptr) {
+    const char msg[] = "{\"type\":\"flush\"}";
+    auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
+    esp_websocket_client_send_text(handle, msg, sizeof(msg) - 1, portMAX_DELAY);
+    ESP_LOGI(TAG, "follow-up window closed — sent flush (drop uncommitted mic audio)");
+  }
+}
+
+void VaClient::send_wake_() {
+  // Tell the backend a fresh wake started (dangling-VAD guard, A). Until the
+  // user actually speaks this turn, OpenAI's server VAD can still fire an
+  // end-of-turn for a PREVIOUS utterance that never closed (the reply gated the
+  // mic mid-sentence) — committing it auto-creates a garbage answer to an empty
+  // turn. The backend uses this signal to suppress that stale thinking + cancel
+  // the racing response. Sent on every start_session(); old backends ignore it.
+  if (this->ws_connected_ && this->ws_handle_ != nullptr) {
+    const char msg[] = "{\"type\":\"wake\"}";
+    auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
+    esp_websocket_client_send_text(handle, msg, sizeof(msg) - 1, portMAX_DELAY);
+    ESP_LOGI(TAG, "wake — sent {\"type\":\"wake\"} (dangling-VAD guard)");
+  }
 }
 
 void VaClient::fire_phase_led_(const std::string &phase) {
@@ -1013,18 +1180,24 @@ void VaClient::commit_followup_mic() {
     if (this->streaming_) {
       ESP_LOGI(TAG, "follow-up window expired — mic streaming off");
       this->streaming_ = false;
+      this->send_mic_flush_();  // drop any uncommitted partial utterance
     }
   });
 }
 
 void VaClient::send_interrupt() {
-  if (!this->ws_connected_ || this->ws_handle_ == nullptr) {
-    ESP_LOGW(TAG, "send_interrupt: WS not connected");
-    return;
+  // Best-effort cancel to the backend — ONLY if the socket is alive. The local
+  // cleanup below must ALWAYS run: returning early on a dead socket (the old
+  // behaviour) left streaming_ on, the PSRAM ring full and the follow-up timers
+  // armed after a "stop" on a dead link, so the mic would resume streaming the
+  // room the instant we reconnected.
+  if (this->ws_connected_ && this->ws_handle_ != nullptr) {
+    const char msg[] = "{\"type\":\"interrupt\"}";
+    auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
+    esp_websocket_client_send_text(handle, msg, sizeof(msg) - 1, portMAX_DELAY);
+  } else {
+    ESP_LOGW(TAG, "send_interrupt: WS not connected — local cleanup only");
   }
-  const char msg[] = "{\"type\":\"interrupt\"}";
-  auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-  esp_websocket_client_send_text(handle, msg, sizeof(msg) - 1, portMAX_DELAY);
   // Flush our PSRAM playback queue — what's already been pushed into the
   // resampler/mixer/leaf will still drain (~600 ms residual), but everything
   // we have yet to hand off is dropped. The yaml side stops the resampler
@@ -1063,6 +1236,11 @@ void VaClient::send_interrupt() {
   // The phase=idle the server is about to send shouldn't open a follow-up
   // mic window — the user said "stop", not "wait for me to keep talking".
   this->suppress_followup_ = true;
+  // Mic gate is now closed: no new turn can begin until a wake. Ignore any
+  // `thinking` the backend emits in the meantime — it's the server VAD's
+  // end-of-turn for the utterance we just cancelled, not a real new turn.
+  // Cleared in start_session() (the next wake). See set_phase_.
+  this->post_stop_guard_ = true;
   this->cancel_timeout("va_followup_open");
   ESP_LOGI(TAG, "send_interrupt — WS msg sent, queue flushed");
 }

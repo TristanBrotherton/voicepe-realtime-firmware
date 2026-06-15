@@ -4,6 +4,7 @@
 #include "esphome/components/microphone/microphone.h"
 #include "esphome/components/speaker/speaker.h"
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -50,6 +51,13 @@ class VaClient : public Component {
 
   bool is_connected() const { return ws_connected_; }
 
+  // Delay (ms) the yaml wake handler waits after the wake chime before opening
+  // the mic, so the chime's i2s/DAC tail can't leak into the fresh mic and
+  // become a ghost turn. Pushed from the backend `hello` (wake_open_delay_ms);
+  // the wake automation reads it via `- delay: !lambda`. Defaults to the safe
+  // kWakeOpenDelayMs so an old backend (no key) still behaves sensibly.
+  uint32_t get_wake_open_delay_ms() const { return wake_open_delay_ms_; }
+
   void setup() override;
   void loop() override;
   float get_setup_priority() const override { return setup_priority::AFTER_WIFI; }
@@ -63,6 +71,14 @@ class VaClient : public Component {
   // is no longer armed (e.g. user already pressed wake before the chime
   // finished — the new session takes priority).
   void commit_followup_mic();
+  // True once this turn has produced audible reply audio (the first
+  // non-suppressed binary chunk set turn_t_first_audio_out_; reset to 0 on
+  // every start_session()). The yaml "stop" handler uses this to ignore a
+  // detection while the user is still asking / the model is still thinking —
+  // there is nothing to stop yet, and a false "stop" on the user's own speech
+  // would otherwise corrupt the turn (no follow-up window). Reply/follow-up/
+  // request-follow-up windows all have it set, so a real barge-in still works.
+  bool turn_has_reply_audio() const { return this->turn_t_first_audio_out_ != 0; }
 
   // Called from the static esp-idf event handler trampoline.
   void on_ws_event(int32_t event_id, void *event_data);
@@ -71,6 +87,18 @@ class VaClient : public Component {
   void connect_();
   void schedule_reconnect_();
   void on_mic_data_(const std::vector<uint8_t> &samples);
+  // Tell the backend to drop any uncommitted mic audio NOW. Sent when the mic
+  // gate closes mid-stream by TIMER (a follow-up window expiring) — a partial
+  // utterance left in OpenAI's input buffer would otherwise be "completed" by a
+  // later wake and answered as a stale half-sentence. Clearing at the cut-off
+  // source means no reactive clear-on-wake is needed (that one disturbed the
+  // server VAD and caused spurious garbage commits). No-op if nothing buffered.
+  void send_mic_flush_();
+  // Tell the backend a fresh wake started ({"type":"wake"}), for the
+  // dangling-VAD guard: a server-VAD end-of-turn before the user speaks is a
+  // stale pre-wake segment → backend suppresses its thinking + cancels its
+  // garbage response. Sent on every start_session(); old backends ignore it.
+  void send_wake_();
   // Mic pre-roll helper (mic-task only, no lock). push appends to the rolling
   // ring while the session is closed; the ring is DISCARDED (not replayed) on
   // session open — see preroll_discard_pending_.
@@ -100,7 +128,15 @@ class VaClient : public Component {
   // guard we'd double-bump the backoff delay and double-log.
   bool reconnect_pending_{false};
 
-  std::string current_phase_{"idle"};
+  // Server-driven phase, stored as an atomic enum. set_phase_ WRITES it on
+  // the WS task while start_session() (main loop) READS it for the residual-
+  // reply check — as a std::string that was a cross-task data race (benign in
+  // practice thanks to SSO, but UB). The yaml trigger path still receives the
+  // phase as a string parameter; only this cross-task state is an enum.
+  enum class Phase : uint8_t { IDLE = 0, LISTENING, THINKING, REPLYING };
+  static Phase phase_from_string_(const std::string &phase);
+  static const char *phase_name_(Phase p);
+  std::atomic<uint8_t> current_phase_{static_cast<uint8_t>(Phase::IDLE)};
   std::vector<OnPhaseTrigger *> phase_triggers_;
   std::vector<OnRepeatedFailureTrigger *> repeated_failure_triggers_;
   std::vector<OnFollowupOpenedTrigger *> followup_opened_triggers_;
@@ -187,6 +223,18 @@ class VaClient : public Component {
   // cancelled reply actually goes silent. Cleared in set_phase_ on the next
   // "idle" (reply ended) or "listening" (a fresh turn's audio is legitimate).
   bool suppress_incoming_audio_{false};
+  // Set by send_interrupt() (a local "stop"), cleared in start_session() (the
+  // next wake). After a stop the mic gate is CLOSED, so no new turn can begin
+  // until a wake — yet OpenAI's server VAD can still fire an end-of-turn for
+  // the utterance we just cancelled, which the backend turns into a `thinking`
+  // phase. Acting on that strands the LED in `thinking` until the backend's
+  // 15 s watchdog (observed live 2026-06-14: "stop" mid-question -> 15 s stuck
+  // thinking). While this is true, set_phase_ IGNORES `thinking` — it can only
+  // be the stale tail of the cancelled turn (a legitimate `thinking` is always
+  // preceded by a wake, which clears this). Scoped to `thinking` only: a web
+  // search's replying->thinking has no stop so this stays false (don't break
+  // the search animation), and a reply-drain emits no `thinking` (mic gated).
+  bool post_stop_guard_{false};
   // Live duration (ms) of the post-reply follow-up window: how long the mic
   // stays open after the assistant finishes so the user can answer back
   // WITHOUT re-saying the wake word. Pushed from the backend add-on in the
@@ -205,6 +253,14 @@ class VaClient : public Component {
   // of hearing the tail; higher = safer). Clamped to kFollowupOpenDelayMaxMs.
   uint32_t followup_open_delay_ms_{kFollowupOpenDelayMs};
   static constexpr uint32_t kFollowupOpenDelayMaxMs = 5000;
+  // Wake-chime echo guard: delay (ms) the yaml wake handler waits after the
+  // wake chime before opening the mic. The wake-path twin of
+  // followup_open_delay_ms_ (the follow-up boundary). Pushed from the backend
+  // `hello` ("wake_open_delay_ms":N); read by yaml via get_wake_open_delay_ms().
+  // Default 700 matches the backend default so a device on an old backend (no
+  // key in hello) still gets the safe value rather than the old hardcoded 400.
+  static constexpr uint32_t kWakeOpenDelayMs = 700;
+  uint32_t wake_open_delay_ms_{kWakeOpenDelayMs};
   // Playback jitter buffer ("prebuffer"). Before starting/resuming playback we
   // hold audio in the PSRAM ring until at least this many ms have accumulated
   // (or a short deadline elapses), so the downstream resampler/mixer/i2s chain
