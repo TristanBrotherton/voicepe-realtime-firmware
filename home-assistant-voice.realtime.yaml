@@ -85,12 +85,13 @@ esphome:
       # dispatcher routes to no_ha_connection (red twinkle) until both wifi and
       # va_client WS come up — then it falls through to the idle phase naturally.
       - lambda: id(init_in_progress) = false;
-      # Seed va_client with the restored media_player volume so the first
-      # TTS reply respects the user's volume setting instead of blasting
-      # at 100% until they touch the +/- buttons.
+      # LOCAL EDIT: seed va_client at unity (0 when muted). The media_player
+      # knob already scales ALL output in hardware (mixer/resampler forward
+      # set_volume to the i2s leaf -> AIC3204 DAC), so mirroring the knob into
+      # the va_client sample scaler attenuated TTS twice: at knob 0.5 the
+      # assistant's voice was 6 dB quieter than the device's own chimes.
       - lambda: |-
-          id(va).set_volume(id(external_media_player).is_muted() ? 0.0f
-                                                                 : id(external_media_player).volume);
+          id(va).set_volume(id(external_media_player).is_muted() ? 0.0f : 1.0f);
       - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
       - script.execute: control_leds
       # If after 10 minutes, the device is still initializing (It did not yet connect to Home Assistant), turn off the init_in_progress variable and run the script to refresh the LED status
@@ -1805,22 +1806,22 @@ media_player:
         - http_announcement_source
     volume_increment: 0.05
     volume_min: 0.4
-    volume_max: 0.85
-    # Mirror the media_player volume / mute state into va_client so the
-    # device's physical +/- buttons and mute switch scale our TTS output.
-    # (No api: block on this firmware — there's no HA-side slider, the
-    # media_player exists only inside ESPHome.) Without this hook va_client
-    # writes into media_resampling_speaker bypassing the media_player, so
-    # the volume control would only affect chime announcements (wake /
-    # mute / error) — not the assistant's voice.
+    # LOCAL EDIT: 0.85 -> 0.92 (~ +6 dB at the AIC3204 DAC, 0.875 dB per 0.01).
+    # Compensates OpenAI realtime TTS peaking at -3..-6 dBFS vs ~0 dBFS for the
+    # stock HA TTS engines (see upstream commits fe253d0 / 5e23622).
+    volume_max: 0.92
+    # LOCAL EDIT: mute still zeroes va_client, but the knob is no longer
+    # mirrored into the va_client sample scaler — the DAC hardware volume
+    # already covers va_client's lane (same i2s leaf as the chimes), and the
+    # double scaling made TTS quieter than the chimes at every knob position
+    # below max. va stays at unity except while muted.
     on_volume:
       - lambda: |-
-          id(va).set_volume(id(external_media_player).is_muted() ? 0.0f
-                                                                 : id(external_media_player).volume);
+          id(va).set_volume(id(external_media_player).is_muted() ? 0.0f : 1.0f);
     on_mute:
       - lambda: 'id(va).set_volume(0.0f);'
     on_unmute:
-      - lambda: 'id(va).set_volume(id(external_media_player).volume);'
+      - lambda: 'id(va).set_volume(1.0f);'
 
 sendspin:
   id: sendspin_hub
@@ -1900,7 +1901,7 @@ external_components:
   #   - source: {type: local, path: esphome/components}
   - source:
       type: git
-      url: https://github.com/xandervanerven/home-assistant-voice-pe
+      url: https://github.com/TristanBrotherton/home-assistant-voice-pe
       ref: main
     components: [va_client]
     refresh: 0s
@@ -2092,10 +2093,15 @@ micro_wake_word:
     # The stock start words (okay_nabu / hey_jarvis / hey_mycroft) were
     # removed on purpose. "stop" stays — it's the reliable barge-in/interrupt
     # word, armed only while the assistant is replying (see on_phase below).
-    # kahrendt/microWakeWord redirects to the OHF-Voice org automatically.
-    - model: https://github.com/kahrendt/microWakeWord/releases/download/v2.1_models/alexa.json
+    # FORK EDIT: custom-trained "hey leonard" microWakeWord model (see models/ in
+    # this repo: 50k dual-accent synthetic positives en_US-libritts_r + en_GB-vctk,
+    # 4k confusable negatives, 70k training steps; calibrated recall 97.7% at
+    # 0.93 false-accepts/hour, cutoff 0.43, sliding window 3). id stays `alexa`
+    # so the sensitivity select keeps working. To use a stock wake word instead:
+    # https://github.com/OHF-Voice/micro-wake-word/releases/download/v2.1_models/hey_jarvis.json
+    - model: github://TristanBrotherton/home-assistant-voice-pe/models/hey_leonard.json@main
       id: alexa
-    - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
+    - model: https://github.com/OHF-Voice/micro-wake-word/releases/download/stop/stop.json
       id: stop
       internal: true
       # The model ships with cutoff 0.5. This baked 0.4 is only the boot/quiet
@@ -2326,11 +2332,11 @@ select:
       # accepts. Spacing mirrors the proven okay_nabu tiers.
       lambda: |-
         if (x == "Slightly sensitive") {
-          id(alexa).set_probability_cutoff(217);   // ~0.85
+          id(alexa).set_probability_cutoff(89);    // ~0.35 (LOCAL EDIT: remapped for hey_leonard) (LOCAL EDIT: remapped for hey_leonard, calibrated 0.43)
         } else if (x == "Moderately sensitive") {
-          id(alexa).set_probability_cutoff(178);   // ~0.70
+          id(alexa).set_probability_cutoff(110);   // ~0.43 = calibrated cutoff (LOCAL EDIT)
         } else if (x == "Very sensitive") {
-          id(alexa).set_probability_cutoff(140);   // ~0.55
+          id(alexa).set_probability_cutoff(89);    // ~0.35 (LOCAL EDIT: remapped for hey_leonard)
         }
 
 

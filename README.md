@@ -1,4 +1,29 @@
-# Home Assistant Voice PE — OpenAI Realtime 2 fork
+# Home Assistant Voice PE — OpenAI Realtime 2 fork (TristanBrotherton variant)
+
+> [!NOTE]
+> **This fork** of [xandervanerven/home-assistant-voice-pe](https://github.com/xandervanerven/home-assistant-voice-pe)
+> carries a small set of local changes on top of upstream v1.2.0:
+> 1. **Custom wake word "hey leonard"** — a self-trained microWakeWord v2 model
+>    (`models/hey_leonard.json` + `.tflite` in this repo), trained on 50k synthetic
+>    positives across ~900 US + ~109 UK voices plus 4k confusable negatives;
+>    calibrated to 97.7% recall at <1 false accept/hour. Swap the `micro_wake_word`
+>    model URL back to a stock model if you want okay-nabu/hey-jarvis/alexa.
+> 2. **Wake-word model URLs fixed** — the kahrendt `v2.1_models` release URLs 404;
+>    models moved to the OHF-Voice org.
+> 3. **Louder TTS** — `volume_max` 0.85 → 0.92 (~+6 dB at the DAC) to compensate
+>    for OpenAI Realtime audio peaking at −3..−6 dBFS vs ~0 dBFS for stock HA TTS.
+> 4. **Double-attenuation fix** — `va_client` output is held at unity gain (0 when
+>    muted) instead of mirroring the volume knob into the sample scaler; the DAC
+>    hardware volume already scales that lane, so the old behavior made the
+>    assistant quieter than the device's own chimes at every knob position below max.
+> 5. `va_client` external component + wake model are pulled from **this repo**, so
+>    builds don't depend on upstream availability.
+>
+> All changes are tagged `FORK EDIT` / `LOCAL EDIT` in
+> [`home-assistant-voice.realtime.yaml`](home-assistant-voice.realtime.yaml).
+> Pair with the backend fork: **[TristanBrotherton/ha-openai-realtime](https://github.com/TristanBrotherton/ha-openai-realtime)**.
+> Upstream docs follow below.
+
 
 > [!IMPORTANT]
 > **This is 1 of 2 repos — you need both halves.** This repo is the **device
