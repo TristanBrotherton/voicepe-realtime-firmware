@@ -1,4 +1,4 @@
-# Home Assistant Voice PE — OpenAI Realtime 2 fork (TristanBrotherton variant)
+# Voice PE Realtime — device firmware
 
 > [!NOTE]
 > **This fork** of [TristanBrotherton/home-assistant-voice-pe](https://github.com/TristanBrotherton/home-assistant-voice-pe)
