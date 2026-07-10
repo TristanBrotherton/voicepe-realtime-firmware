@@ -2385,11 +2385,11 @@ select:
       # accepts. Spacing mirrors the proven okay_nabu tiers.
       lambda: |-
         if (x == "Slightly sensitive") {
-          id(alexa).set_probability_cutoff(89);    // ~0.35 (LOCAL EDIT: remapped for hey_leonard) (LOCAL EDIT: remapped for hey_leonard, calibrated 0.43)
+          id(alexa).set_probability_cutoff(128);   // ~0.50 (v2 model) (LOCAL EDIT: remapped for hey_leonard, calibrated 0.43)
         } else if (x == "Moderately sensitive") {
-          id(alexa).set_probability_cutoff(110);   // ~0.43 = calibrated cutoff (LOCAL EDIT)
+          id(alexa).set_probability_cutoff(153);   // ~0.60 = v2 calibrated cutoff
         } else if (x == "Very sensitive") {
-          id(alexa).set_probability_cutoff(89);    // ~0.35 (LOCAL EDIT: remapped for hey_leonard)
+          id(alexa).set_probability_cutoff(128);   // ~0.50 (v2 model)
         }
 
 
