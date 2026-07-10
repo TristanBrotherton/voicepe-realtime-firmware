@@ -1,7 +1,7 @@
 # Voice PE Realtime — device firmware
 
 > [!NOTE]
-> **This fork** of [TristanBrotherton/home-assistant-voice-pe](https://github.com/TristanBrotherton/home-assistant-voice-pe)
+> **This fork** of [TristanBrotherton/voicepe-realtime-firmware](https://github.com/TristanBrotherton/voicepe-realtime-firmware)
 > carries a small set of local changes on top of upstream v1.2.0:
 > 1. **Custom wake word "hey leonard"** — a self-trained microWakeWord v2 model
 >    (`models/hey_leonard.json` + `.tflite` in this repo), trained on 50k synthetic
@@ -21,7 +21,7 @@
 >
 > All changes are tagged `FORK EDIT` / `LOCAL EDIT` in
 > [`home-assistant-voice.realtime.yaml`](home-assistant-voice.realtime.yaml).
-> Pair with the backend fork: **[TristanBrotherton/ha-openai-realtime](https://github.com/TristanBrotherton/ha-openai-realtime)**.
+> Pair with the backend fork: **[TristanBrotherton/voicepe-realtime-backend](https://github.com/TristanBrotherton/voicepe-realtime-backend)**.
 > Upstream docs follow below.
 
 
@@ -30,7 +30,7 @@
 > firmware**; on its own it does nothing. It streams audio to a backend add-on that
 > runs the OpenAI Realtime session and controls Home Assistant. You must set up both:
 > - 🔌 **Device firmware** (this repo) — flashed onto the Voice PE
-> - 🧠 **Backend add-on** → **[TristanBrotherton/ha-openai-realtime](https://github.com/TristanBrotherton/ha-openai-realtime)** (runs in Home Assistant)
+> - 🧠 **Backend add-on** → **[TristanBrotherton/voicepe-realtime-backend](https://github.com/TristanBrotherton/voicepe-realtime-backend)** (runs in Home Assistant)
 >
 > 📖 New here? The full **[INSTALL guide](INSTALL.md)** sets up both halves, step by step.
 
@@ -69,7 +69,7 @@
 ## Setup (ESPHome Builder)
 
 1. Install and configure the **OpenAI Realtime 2 Voice Agent** add-on from
-   [TristanBrotherton/ha-openai-realtime](https://github.com/TristanBrotherton/ha-openai-realtime)
+   [TristanBrotherton/voicepe-realtime-backend](https://github.com/TristanBrotherton/voicepe-realtime-backend)
    (sets your OpenAI API key, the model, and the Home Assistant MCP connection).
 2. In **Builder → Secrets**, add the keys from
    [`secrets.yaml.example`](secrets.yaml.example): `wifi_ssid`, `wifi_password`,

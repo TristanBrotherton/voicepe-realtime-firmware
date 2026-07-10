@@ -37,7 +37,7 @@ up online** (weather, news, facts) — web search is on by default.
 
 1. In Home Assistant: **Settings → Add-ons → Add-on Store**.
 2. Top-right **⋮ → Repositories** → paste and add:
-   `https://github.com/TristanBrotherton/ha-openai-realtime`
+   `https://github.com/TristanBrotherton/voicepe-realtime-backend`
 3. Find **OpenAI Realtime 2 Voice Agent** in the store and click **Install**.
    Home Assistant builds it locally — this takes a few minutes the first time.
 
@@ -151,8 +151,8 @@ api_key: "the-API-encryption-key-from-step-2.2"   # 44-char base64
 
 1. In ESPHome Builder, **Edit** the adopted device and **replace its entire YAML** with
    a ready-made stub from the firmware repo:
-   - DHCP: [`esphome-builder.dhcp.yaml`](https://github.com/TristanBrotherton/home-assistant-voice-pe/blob/main/esphome-builder.dhcp.yaml)
-   - Fixed IP: [`esphome-builder.static-ip.yaml`](https://github.com/TristanBrotherton/home-assistant-voice-pe/blob/main/esphome-builder.static-ip.yaml)
+   - DHCP: [`esphome-builder.dhcp.yaml`](https://github.com/TristanBrotherton/voicepe-realtime-firmware/blob/main/esphome-builder.dhcp.yaml)
+   - Fixed IP: [`esphome-builder.static-ip.yaml`](https://github.com/TristanBrotherton/voicepe-realtime-firmware/blob/main/esphome-builder.static-ip.yaml)
 
    Set `name` and `friendly_name`, and **keep** the `packages:` / `dashboard_import:`
    lines — those are what pull the full firmware from the repo. Save.
