@@ -404,6 +404,10 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
         ESP_LOGW(TAG, "WS disconnected (event %d)", (int) event_id);
       }
       this->ws_connected_ = false;
+      // A dropped WS mid-enrollment must not leave the mic pinned open with
+      // nobody recording — exit enrollment locally (no notify; link is gone).
+      if (this->enroll_mode_)
+        this->defer([this]() { this->enroll_stop(false); });
       // Connection broke before the stability window elapsed — keep the
       // failure counter and the fired flag. A flapping link won't earn
       // a fresh chime.
@@ -491,6 +495,18 @@ void VaClient::handle_text_(const char *data, size_t len) {
              (unsigned) this->audio_fill_);
     this->followup_pending_ = true;
     this->request_follow_up_pending_ = true;
+    return;
+  }
+
+  if (msg.find("\"type\":\"enroll\"") != std::string::npos) {
+    const bool start = msg.find("\"mode\":\"start\"") != std::string::npos;
+    ESP_LOGI(TAG, "enroll control from backend: %s", start ? "start" : "stop");
+    this->defer([this, start]() {
+      if (start)
+        this->enroll_start();
+      else
+        this->enroll_stop(false);
+    });
     return;
   }
 
@@ -685,6 +701,8 @@ void VaClient::preroll_push_(const int16_t *data, size_t n) {
 }
 
 VaClient::Phase VaClient::phase_from_string_(const std::string &phase) {
+  if (phase == "enrolling")
+    return Phase::ENROLLING;
   if (phase == "listening")
     return Phase::LISTENING;
   if (phase == "thinking")
@@ -708,6 +726,14 @@ const char *VaClient::phase_name_(Phase p) {
 }
 
 void VaClient::set_phase_(const std::string &phase) {
+  // Enrollment mode: the mic is pinned open and the backend's phase machine is
+  // not driving this device (mic audio is not forwarded to OpenAI). Stray
+  // phases — notably the hourly proactive-refresh force-idle — must not close
+  // the mic or repaint the LED mid-session.
+  if (this->enroll_mode_ && phase != "enrolling") {
+    ESP_LOGD(TAG, "ignoring phase '%s' during enrollment", phase.c_str());
+    return;
+  }
   // Don't dedupe — we want yaml-side control_leds to re-render even on
   // identical phase if other inputs (e.g. va WS connection state) have
   // changed since the last emission.
@@ -936,6 +962,10 @@ void VaClient::set_phase_(const std::string &phase) {
 }
 
 void VaClient::start_session() {
+  if (this->enroll_mode_) {
+    ESP_LOGW(TAG, "wake ignored — enrollment mode active");
+    return;
+  }
   // Open the streaming window. on_mic_data_ will start forwarding frames to
   // the server until "phase":"idle" comes back (response.done). Without this
   // gate, OpenAI Realtime's server VAD would respond to any speech in the
@@ -1111,6 +1141,54 @@ void VaClient::open_followup_window_(uint32_t duration_ms) {
       }
     });
   });
+}
+
+void VaClient::enroll_start() {
+  if (this->enroll_mode_)
+    return;
+  ESP_LOGI(TAG, "enrollment START — mic pinned open, session timers suspended");
+  this->cancel_timeout("va_no_speech");
+  this->cancel_timeout("va_followup");
+  this->cancel_timeout("va_followup_open");
+  this->cancel_timeout("va_tts_tail");
+  this->followup_pending_ = false;
+  this->waiting_for_speaker_stop_ = false;
+  this->request_follow_up_pending_ = false;
+  this->followup_armed_ = false;
+  this->idle_emit_pending_ = false;
+  this->suppress_followup_ = false;
+  this->post_stop_guard_ = false;
+  this->suppress_incoming_audio_ = false;
+  this->preroll_discard_pending_ = true;
+  this->enroll_mode_ = true;
+  this->enroll_started_ms_ = millis();
+  this->streaming_ = true;
+  this->set_phase_("enrolling");
+  // Hard cap: a forgotten/hung session must not stream the household forever.
+  this->set_timeout("va_enroll_cap", kEnrollMaxMs, [this]() {
+    ESP_LOGW(TAG, "enrollment hit the safety cap — stopping");
+    this->enroll_stop(true);
+  });
+}
+
+void VaClient::enroll_stop(bool notify_backend) {
+  if (!this->enroll_mode_)
+    return;
+  ESP_LOGI(TAG, "enrollment STOP (%s) after %u s",
+           notify_backend ? "device-initiated" : "backend-initiated",
+           (unsigned) ((millis() - this->enroll_started_ms_) / 1000));
+  this->cancel_timeout("va_enroll_cap");
+  this->enroll_mode_ = false;
+  this->streaming_ = false;
+  // Don't let the routine idle transition open a follow-up mic window — the
+  // session is over, the device should go fully to rest.
+  this->suppress_followup_ = true;
+  if (notify_backend && this->ws_connected_ && this->ws_handle_ != nullptr) {
+    const char m[] = "{\"type\":\"enroll_stopped\"}";
+    auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
+    esp_websocket_client_send_text(handle, m, sizeof(m) - 1, 100 / portTICK_PERIOD_MS);
+  }
+  this->set_phase_("idle");
 }
 
 void VaClient::send_mic_flush_() {

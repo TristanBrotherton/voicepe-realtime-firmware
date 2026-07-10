@@ -30,6 +30,8 @@ substitutions:
   voice_assist_thinking_phase_id: '4'
   # The voice assistant is replying to the command
   voice_assist_replying_phase_id: '5'
+  # The device is in voice-enrollment mode (fork): mic pinned open, recording
+  voice_assist_enrolling_phase_id: '6'
   # The voice assistant is not ready
   voice_assist_not_ready_phase_id: '10'
   # The voice assistant encountered an error
@@ -221,6 +223,7 @@ text_sensor:
         case ${voice_assist_listening_for_command_phase_id}: return std::string("listening");
         case ${voice_assist_thinking_phase_id}: return std::string("thinking");
         case ${voice_assist_replying_phase_id}: return std::string("replying");
+        case ${voice_assist_enrolling_phase_id}: return std::string("enrolling");
         case ${voice_assist_not_ready_phase_id}: return std::string("not_ready");
         case ${voice_assist_error_phase_id}: return std::string("error");
         default: return std::string("unknown");
@@ -460,6 +463,14 @@ binary_sensor:
               condition:
                 lambda: return !id(init_in_progress) && !id(color_changed) && !id(group_volume_changed);
               then:
+                # Enrollment (fork): a single press is the physical escape hatch —
+                # stop recording, notify the backend, back to idle.
+                - if:
+                    condition:
+                      lambda: 'return id(va)->enroll_active();'
+                    then:
+                      - lambda: 'id(va)->enroll_stop(true);'
+                      - script.execute: control_leds
                 - if:
                     condition:
                       switch.is_on: timer_ringing
@@ -780,6 +791,21 @@ light:
               }
             }
             id(global_led_animation_index) = (id(global_led_animation_index) + 1) % 12;
+      - addressable_lambda:
+          name: "Enrolling"
+          update_interval: 60ms
+          lambda: |-
+            // Calm whole-ring breathe: the mic is open and recording.
+            auto light_color = id(led_ring).current_values;
+            Color color(light_color.get_red() * 255, light_color.get_green() * 255,
+                  light_color.get_blue() * 255);
+            id(global_led_animation_index) = (id(global_led_animation_index) + 1) % 64;
+            int idx = id(global_led_animation_index);
+            int level = idx < 32 ? idx : 64 - idx;   // 0..32..0 triangle
+            uint8_t scale = 64 + (level * 6);        // 64..256 brightness ramp
+            for (uint8_t i = 0; i < 12; i++) {
+              it[i] = color * scale;
+            }
       - addressable_lambda:
           name: "Listening For Command"
           update_interval: 50ms
@@ -1261,6 +1287,8 @@ script:
             id(control_leds_voice_assistant_thinking_phase).execute();
           } else if (id(voice_assistant_phase) == ${voice_assist_replying_phase_id}) {
             id(control_leds_voice_assistant_replying_phase).execute();
+          } else if (id(voice_assistant_phase) == ${voice_assist_enrolling_phase_id}) {
+            id(control_leds_voice_assistant_enrolling_phase).execute();
           } else if (id(voice_assistant_phase) == ${voice_assist_error_phase_id}) {
             id(control_leds_voice_assistant_error_phase).execute();
           } else if (id(voice_assistant_phase) == ${voice_assist_not_ready_phase_id}) {
@@ -1422,6 +1450,17 @@ script:
           brightness: !lambda return max( id(led_ring).current_values.get_brightness() , 0.2f );
           id: voice_assistant_leds
           effect: "Replying"
+
+  # Enrollment mode (fork): calm cyan so the user knows the mic is recording.
+  - id: control_leds_voice_assistant_enrolling_phase
+    then:
+      - light.turn_on:
+          brightness: !lambda return max( id(led_ring).current_values.get_brightness() , 0.2f );
+          id: voice_assistant_leds
+          red: 0%
+          green: 70%
+          blue: 100%
+          effect: "Enrolling"
 
   # Script executed when the voice assistant is in error
   # Fast Red Pulse
@@ -1954,6 +1993,8 @@ va_client:
           id(voice_assistant_phase) = ${voice_assist_thinking_phase_id};
         } else if (phase == "replying") {
           id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
+        } else if (phase == "enrolling") {
+          id(voice_assistant_phase) = ${voice_assist_enrolling_phase_id};
         }
     - script.execute: control_leds
     # va-direct: re-arm the wake word whenever we return to idle. micro_wake_word
@@ -1961,11 +2002,23 @@ va_client:
     # guarantees detection is running again after every session teardown / WS
     # (re)connect, mirroring the reference's on_disconnected restart. Idempotent
     # if already running.
+    # Enrollment (fork): keep the mww ENGINE running (it owns the i2s mic
+    # stream — stopping it would silence va_client too) but disable BOTH
+    # models so nothing can fire mid-session.
+    - if:
+        condition:
+          lambda: 'return phase == "enrolling";'
+        then:
+          - micro_wake_word.disable_model: alexa
+          - micro_wake_word.disable_model: stop
+          - script.stop: followup_window_watchdog
     - if:
         condition:
           lambda: 'return phase == "idle";'
         then:
           - micro_wake_word.start:
+          # Re-enable the start word (a no-op except after enrollment disabled it).
+          - micro_wake_word.enable_model: alexa
     # Arm "stop" for the WHOLE reply AND through the follow-up listening window —
     # not just while the backend says "replying". Two reasons:
     #  1) The backend bursts the reply; the device keeps playing the audio TAIL
