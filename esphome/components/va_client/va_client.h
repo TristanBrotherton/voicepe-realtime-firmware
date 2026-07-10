@@ -64,6 +64,12 @@ class VaClient : public Component {
 
   // YAML-callable actions.
   void start_session();
+  // Enrollment mode (fork): mic pinned open streaming to the backend, session
+  // timers suspended, backend phases ignored. Entered/exited via the backend's
+  // {"type":"enroll","mode":...} control message or device-side (button/cap).
+  void enroll_start();
+  void enroll_stop(bool notify_backend);
+  bool enroll_active() const { return this->enroll_mode_; }
   void send_interrupt();
   // Called from yaml's on_followup_opened automation AFTER the chime has
   // finished announcing through the speaker (wait_until !is_announcing +
@@ -133,7 +139,7 @@ class VaClient : public Component {
   // reply check — as a std::string that was a cross-task data race (benign in
   // practice thanks to SSO, but UB). The yaml trigger path still receives the
   // phase as a string parameter; only this cross-task state is an enum.
-  enum class Phase : uint8_t { IDLE = 0, LISTENING, THINKING, REPLYING };
+  enum class Phase : uint8_t { IDLE = 0, LISTENING, THINKING, REPLYING, ENROLLING };
   static Phase phase_from_string_(const std::string &phase);
   static const char *phase_name_(Phase p);
   std::atomic<uint8_t> current_phase_{static_cast<uint8_t>(Phase::IDLE)};
@@ -188,6 +194,11 @@ class VaClient : public Component {
   //   - between wake-word start_session() and "listening"/"thinking"
   //   - and again after "idle" for kFollowupMs (in case AI asked a question)
   bool streaming_{false};
+  // Enrollment mode: while true, streaming_ stays on, backend phases are
+  // ignored, and a hard cap timer guards against a forgotten session.
+  bool enroll_mode_{false};
+  uint32_t enroll_started_ms_{0};
+  static constexpr uint32_t kEnrollMaxMs = 10 * 60 * 1000;
   // Handsfree barge-in toggle, set from yaml (`barge_in:`). See set_barge_in().
   bool barge_in_{true};
   // Set on phase=idle when there's still TTS audio queued — we can't open
