@@ -34,7 +34,7 @@ substitutions:
 # every compile fetch the latest release.
 packages:
   realtime:
-    url: https://github.com/TristanBrotherton/home-assistant-voice-pe
+    url: https://github.com/TristanBrotherton/voicepe-realtime-firmware
     ref: main
     files: [home-assistant-voice.realtime.yaml]
     refresh: 0s
@@ -49,5 +49,5 @@ packages:
         dns2: ${dns2}
 
 dashboard_import:
-  package_import_url: github://TristanBrotherton/home-assistant-voice-pe/home-assistant-voice.realtime.yaml@main
+  package_import_url: github://TristanBrotherton/voicepe-realtime-firmware/home-assistant-voice.realtime.yaml@main
   import_full_config: false
