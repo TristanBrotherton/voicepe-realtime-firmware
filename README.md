@@ -62,6 +62,16 @@ model's trajectory doing exactly this: detection cutoff 0.43 → 0.71 at ~97%
 recall in three passes. Training runs on any Apple Silicon or NVIDIA machine
 in ~2 hours.
 
+## Also included
+
+- **Model rollback**: `models/previous/` holds the prior wake model — one copy
+  + flash to revert (see the backend repo's reflash runbook)
+- **Double-press** the center button = flag a false wake (any time)
+- **Silent connection errors**: LED-only (red twinkle) — no spoken "cloud
+  unavailable" announcements at night; the wake-time error chime (user-initiated
+  feedback) is kept
+- **Timer ring switch** exposed to HA for the backend's voice timers
+
 ---
 *Based on / inspired by xandervanerven's and maxmaxme's Voice PE work and the
 official esphome/home-assistant-voice-pe — with thanks.*
