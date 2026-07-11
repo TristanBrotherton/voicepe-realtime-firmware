@@ -331,7 +331,7 @@ class VaClient : public Component {
   // phase=listening (i.e. server VAD heard speech). If nothing comes, the
   // user pressed wake/button and stayed silent — close the session so we
   // don't sit there with the mic open eating OpenAI minutes.
-  static constexpr uint32_t kNoSpeechTimeoutMs = 7000;
+  static constexpr uint32_t kNoSpeechTimeoutMs = 12000;
   // After our PSRAM queue drains there's still audio in flight:
   //   resampler ring 4800 B (≈ 50 ms)
   //   mixer source buffer 100 ms

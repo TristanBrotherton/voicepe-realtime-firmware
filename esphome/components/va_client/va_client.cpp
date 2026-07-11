@@ -498,6 +498,17 @@ void VaClient::handle_text_(const char *data, size_t len) {
     return;
   }
 
+  if (msg.find("\"type\":\"ack\"") != std::string::npos) {
+    // Backend confirms mic audio is flowing for this turn. Cancel the
+    // no-speech abort: with semantic VAD the "speech detected" phase can
+    // arrive only at utterance COMMIT, which for longer commands lands past
+    // any reasonable fixed timeout (community report: aborts mid-sentence).
+    // Silent misfires still close via the follow-up window flush timers.
+    this->cancel_timeout("va_no_speech");
+    ESP_LOGD(TAG, "backend audio ack — no-speech watchdog cancelled");
+    return;
+  }
+
   if (msg.find("\"type\":\"enroll\"") != std::string::npos) {
     const bool start = msg.find("\"mode\":\"start\"") != std::string::npos;
     ESP_LOGI(TAG, "enroll control from backend: %s", start ? "start" : "stop");
