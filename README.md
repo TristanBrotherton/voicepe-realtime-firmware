@@ -1,108 +1,32 @@
 # Voice PE Realtime — device firmware
 
-> [!IMPORTANT]
-> **The default wake word is "HEY LEONARD"** — a custom microWakeWord model
-> trained by this project (it's the worked example of the training flywheel
-> below). Prefer a standard one? Pick **Hey Jarvis** or **Okay Nabu** from the
-> device's **"Wake word" dropdown in Home Assistant** — no reflash needed — or
-> train your own and point `wake_word_model` at it.
+ESPHome firmware that turns a **Home Assistant Voice PE** into the thin,
+low-latency audio client half of
+**[Voice PE Realtime](https://github.com/TristanBrotherton/voicepe-realtime)**.
+Wake-word detection (default: **"Hey Leonard"**, switchable to Hey Jarvis /
+Okay Nabu from Home Assistant) runs on-device; everything else — speech
+understanding, replies, smart-home control — streams over a local WebSocket to
+the backend add-on's OpenAI Realtime session.
 
-ESPHome firmware that turns a **Home Assistant Voice PE** into a thin,
-low-latency audio client for the
-[Voice PE Realtime backend](https://github.com/TristanBrotherton/voicepe-realtime-backend).
-Wake-word detection runs on-device; everything else — speech understanding,
-replies, smart-home control — streams over a local WebSocket to the backend's
-OpenAI Realtime session. There is no Assist pipeline on the audio path.
+## 📖 All documentation lives in the main repo
 
-## The experience
+**→ [github.com/TristanBrotherton/voicepe-realtime](https://github.com/TristanBrotherton/voicepe-realtime)**
 
-- **Your own wake word.** microWakeWord runs on-device; this repo ships our
-  custom model (`models/`) trained on real household voices via the backend's
-  enrollment feature — and you can train yours the same way, or drop in any
-  stock model (okay nabu / hey jarvis / alexa).
-- **Conversation, not commands.** After each reply the mic reopens briefly so
-  you can follow up naturally. "Stop" interrupts a reply instantly (with a red
-  confirmation flash), tuned per-phase so the assistant's own voice can't
-  false-trigger it.
-- **Enrollment mode.** When the backend runs a voice-training session, the ring
-  breathes cyan, the mic stays open continuously, wake/stop detection disarms,
-  and the center button is a physical escape. A 10-minute hard cap and
-  WS-drop auto-exit guarantee it can never record unattended.
-- **Proper loudness.** OpenAI's audio is mastered quieter than stock TTS; this
-  firmware compensates (+6 dB ceiling, single-attenuation volume path) so
-  replies match the device's own chimes at every knob position.
+- [Getting Started](https://github.com/TristanBrotherton/voicepe-realtime/blob/main/docs/getting-started.md) — flashing this firmware + installing the backend, step by step
+- [Configuration Reference](https://github.com/TristanBrotherton/voicepe-realtime/blob/main/docs/configuration.md) — including this firmware's substitutions (wake word model, sensitivity cutoffs, device name, `va_url`)
+- [Features](https://github.com/TristanBrotherton/voicepe-realtime/blob/main/docs/features.md) — wake words & the retrain flywheel, speaker recognition, timers, and more
+- [FAQ](https://github.com/TristanBrotherton/voicepe-realtime/blob/main/docs/faq.md) — including how to revert to the stock firmware
 
-## Features
+## Building from source
 
-- `va_client` component: raw 16 kHz mic streaming, 24 kHz reply playback,
-  jitter buffering, mic pre-roll, reconnect logic
-- Phase state machine exposed to HA as a text sensor
-  (`idle / waiting / listening / thinking / replying / enrolling`) — trigger
-  automations on it (e.g. pause the kitchen speaker the instant a wake fires)
-- Per-phase stop-word cutoffs; wake-boundary echo guards tunable from the
-  backend without reflashing
-- Enrollment mode (backend-controlled), cyan LED effect, button escape
-- Wake-word sensitivity select in HA (three calibrated levels)
-- Stock niceties preserved: LED ring language, volume dial, mute switch, media
-  player for Music Assistant
-
-## Install
-
-1. In the ESPHome dashboard, create a per-device stub from
-   [`esphome-builder.dhcp.yaml`](esphome-builder.dhcp.yaml) — it imports
-   [`home-assistant-voice.realtime.yaml`](home-assistant-voice.realtime.yaml)
-   from this repo as a remote package, so updates are one click.
-2. Set your Wi-Fi/API secrets and `va_url` (`ws://<ha-ip>:8080/`, one port per
-   device) as substitutions.
-3. Install the [backend add-on](https://github.com/TristanBrotherton/voicepe-realtime-backend),
-   then flash. First flash of a factory device works over the ESPHome
-   dashboard; subsequent updates are OTA.
-
-Full step-by-step setup (both halves, options, troubleshooting): the
-**[Getting Started guide](https://github.com/TristanBrotherton/voicepe-realtime-backend#getting-started-comprehensive)**
-in the backend repo. [INSTALL.md](INSTALL.md) has additional flashing detail.
-
-## Train it on your voice
-
-Enroll through the device itself (say *"teach me my voice"* — the backend
-coaches you through it), then retrain microWakeWord with your recordings as
-weighted positives and your harvested false wakes as hard negatives. Our
-model's trajectory doing exactly this: detection cutoff 0.43 → 0.71 at ~97%
-recall in three passes. Training runs on any Apple Silicon or NVIDIA machine
-in ~2 hours.
-
-## How wake-word training works (the flywheel)
-
-The wake word improves continuously from your household's real usage:
-
-1. **Enroll** — say *"teach me my voice"*. The device pins its mic open and an
-   audio coach collects 25 varied repetitions + 90 s of natural speech per
-   person. Recordings stay on your machine.
-2. **Live labeling** — every wake's opening audio is captured locally. Flag
-   false triggers three ways: say *"that was a false alarm"*, **double-press
-   the center button**, or automatically when you silence a wake that never
-   spoke. Labeled captures become hard negatives.
-3. **Retrain** — a weekly job (or manual run) trains microWakeWord on ~50k
-   synthetic voices (both accents) + your real repetitions (triple weight) +
-   your labeled false wakes, calibrates the detection threshold against
-   held-out audio, and quality-gates the result against the current model
-   (recall and false-accept rate must not regress).
-4. **Stage, never auto-flash** — passing models are staged with their
-   calibration and you're notified; deployment is a deliberate flash. The
-   previous model stays in `models/previous/` for one-step rollback.
-
-Result in this household: detection cutoff 0.43 → 0.71 across three passes at
-~97% recall — each pass trained on the mistakes of the last.
-
-## Also included
-
-- **Model rollback**: `models/previous/` holds the prior wake model — one copy
-  + flash to revert (see the backend repo's reflash runbook)
-- **Double-press** the center button = flag a false wake (any time)
-- **Silent connection errors**: LED-only (red twinkle) — no spoken "cloud
-  unavailable" announcements at night; the wake-time error chime (user-initiated
-  feedback) is kept
-- **Timer ring switch** exposed to HA for the backend's voice timers
+You don't build anything by hand for a normal install — the per-device stub
+([`esphome-builder.dhcp.yaml`](esphome-builder.dhcp.yaml) or
+[`esphome-builder.static-ip.yaml`](esphome-builder.static-ip.yaml)) pulls
+[`home-assistant-voice.realtime.yaml`](home-assistant-voice.realtime.yaml) from
+this repo as a remote package, and ESPHome Builder compiles and flashes it (one
+click for updates). To hack on the firmware itself, point the stub's `packages:`
+block at your fork/branch instead. Wake-word models live in
+[`models/`](models/) (previous model kept in `models/previous/` for rollback).
 
 ---
 *Based on / inspired by xandervanerven's and maxmaxme's Voice PE work and the

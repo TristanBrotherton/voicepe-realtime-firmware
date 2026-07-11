@@ -32,9 +32,6 @@ substitutions:
   voice_assist_replying_phase_id: '5'
   # The device is in voice-enrollment mode (fork): mic pinned open, recording
   voice_assist_enrolling_phase_id: '6'
-  # Wake-word model. DEFAULT = stock "hey jarvis" so new installs work for
-  # everyone. Train your own (see README "How wake-word training works") and
-  # override in your per-device stub — ours points at models/hey_leonard.json.
   # DEFAULT WAKE WORD: "HEY LEONARD" — a custom model trained by this project
   # (see models/ and the README). Switch to Hey Jarvis / Okay Nabu at runtime
   # via the device's "Wake word" dropdown in Home Assistant — no reflash.
