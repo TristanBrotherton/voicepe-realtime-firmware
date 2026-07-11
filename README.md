@@ -1,5 +1,14 @@
 # Voice PE Realtime — device firmware
 
+**Features beyond stock**: custom-trained wake word (models/ in-repo, retrained
+on real household voices), enrollment mode (mic pinned open, models disarmed,
+cyan LED, button escape, 10-min cap), TTS loudness fixes (+6 dB, no double
+attenuation), per-phase stop-word cutoffs, phase sensor for automations.
+
+> Based on / inspired by [xandervanerven/home-assistant-voice-pe](https://github.com/xandervanerven/home-assistant-voice-pe),
+> [maxmaxme/home-assistant-voice-pe](https://github.com/maxmaxme/home-assistant-voice-pe) and the official
+> [esphome/home-assistant-voice-pe](https://github.com/esphome/home-assistant-voice-pe) — with thanks.
+
 > [!NOTE]
 > **This fork** of [TristanBrotherton/voicepe-realtime-firmware](https://github.com/TristanBrotherton/voicepe-realtime-firmware)
 > carries a small set of local changes on top of upstream v1.2.0:
