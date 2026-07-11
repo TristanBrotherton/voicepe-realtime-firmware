@@ -447,6 +447,14 @@ switch:
     internal: true
 
 binary_sensor:
+  # Instant wake pulse (community contribution, r/openclaw): published the
+  # moment micro_wake_word fires — ~1s ahead of the polled voice-phase text
+  # sensor. Use it for duck-the-room automations (pause the TV/music) where
+  # that second matters. 2s pulse, reset by wake_pulse_reset.
+  - platform: template
+    id: wake_detected_pulse
+    name: "Wake word detected"
+    device_class: sound
   # Center Button. Used for many things (See on_multi_click)
   - platform: gpio
     id: center_button
@@ -1272,6 +1280,15 @@ event:
       - easter_egg_press
 
 script:
+  # Ends the wake_detected_pulse. mode: restart so rapid re-wakes extend the
+  # pulse instead of cutting it short.
+  - id: wake_pulse_reset
+    mode: restart
+    then:
+      - delay: 2s
+      - binary_sensor.template.publish:
+          id: wake_detected_pulse
+          state: false
   # Master script controlling the LEDs, based on different conditions : initialization in progress, wifi and api connected and voice assistant phase.
   # For the sake of simplicity and re-usability, the script calls child scripts defined below.
   # This script will be called every time one of these conditions is changing.
@@ -2219,6 +2236,13 @@ micro_wake_word:
   vad:
     probability_cutoff: 0.3
   on_wake_word_detected:
+    # Instant wake pulse — before any guards, exactly "the model fired".
+    # (The delayed reset lives in wake_pulse_reset; an inline delay here
+    # would stall the wake handling below.)
+    - binary_sensor.template.publish:
+        id: wake_detected_pulse
+        state: true
+    - script.execute: wake_pulse_reset
     # TEMP DEBUG (va-direct): log EVERY detection BEFORE the mute guard, so the
     # next flash's log tells "mWW never fired" (mic/XMOS problem) apart from
     # "fired but swallowed by the mute switch". Remove once wake word is confirmed.
