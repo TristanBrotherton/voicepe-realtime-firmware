@@ -1191,6 +1191,15 @@ void VaClient::enroll_stop(bool notify_backend) {
   this->set_phase_("idle");
 }
 
+void VaClient::send_button_cancel() {
+  if (!this->ws_connected_ || this->ws_handle_ == nullptr)
+    return;
+  const char m[] = "{\"type\":\"button_cancel\"}";
+  auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
+  esp_websocket_client_send_text(handle, m, sizeof(m) - 1, 100 / portTICK_PERIOD_MS);
+  ESP_LOGI(TAG, "button cancel sent");
+}
+
 void VaClient::send_mic_flush_() {
   // The mic gate just closed mid-stream because a follow-up window timed out.
   // If the user had started (but not finished) speaking, that audio sits
