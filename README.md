@@ -51,7 +51,9 @@ OpenAI Realtime session. There is no Assist pipeline on the audio path.
    then flash. First flash of a factory device works over the ESPHome
    dashboard; subsequent updates are OTA.
 
-See [INSTALL.md](INSTALL.md) for the full walk-through.
+Full step-by-step setup (both halves, options, troubleshooting): the
+**[Getting Started guide](https://github.com/TristanBrotherton/voicepe-realtime-backend#getting-started-comprehensive)**
+in the backend repo. [INSTALL.md](INSTALL.md) has additional flashing detail.
 
 ## Train it on your voice
 
