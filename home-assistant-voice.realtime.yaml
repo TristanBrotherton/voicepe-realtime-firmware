@@ -553,7 +553,7 @@ binary_sensor:
                     sound_file: "center_button_double_press_sound"
                 # Double-press = explicit "that was a false wake" flag: works
                 # regardless of whether the assistant already replied.
-                - lambda: 'id(va)->send_false_flag();
+                - lambda: 'id(va)->send_false_flag();'
                 - event.trigger:
                     id: button_press_event
                     event_type: "double_press"
