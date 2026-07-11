@@ -43,7 +43,9 @@ substitutions:
   jack_disconnected_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/jack_disconnected.flac
   mute_switch_on_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/mute_switch_on.flac
   mute_switch_off_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/mute_switch_off.flac
-  timer_finished_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/timer_finished.flac
+  # Gentle two-tone bell (synthesized, ~-14 dBFS) — the stock ring was "a
+  # little intense" for a kitchen. Original: .../esphome/home-assistant-voice-pe/raw/dev/sounds/timer_finished.flac
+  timer_finished_sound_file: https://raw.githubusercontent.com/TristanBrotherton/voicepe-realtime-firmware/main/sounds/gentle_timer.flac
   wake_word_triggered_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/wake_word_triggered.flac
   center_button_press_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/center_button_press.flac
   center_button_double_press_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/center_button_double_press.flac
