@@ -1,5 +1,12 @@
 # Voice PE Realtime — device firmware
 
+> [!IMPORTANT]
+> **The default wake word is "HEY LEONARD"** — a custom microWakeWord model
+> trained by this project (it's the worked example of the training flywheel
+> below). Prefer a standard one? Pick **Hey Jarvis** or **Okay Nabu** from the
+> device's **"Wake word" dropdown in Home Assistant** — no reflash needed — or
+> train your own and point `wake_word_model` at it.
+
 ESPHome firmware that turns a **Home Assistant Voice PE** into a thin,
 low-latency audio client for the
 [Voice PE Realtime backend](https://github.com/TristanBrotherton/voicepe-realtime-backend).

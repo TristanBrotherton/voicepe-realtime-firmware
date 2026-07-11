@@ -35,7 +35,11 @@ substitutions:
   # Wake-word model. DEFAULT = stock "hey jarvis" so new installs work for
   # everyone. Train your own (see README "How wake-word training works") and
   # override in your per-device stub — ours points at models/hey_leonard.json.
-  wake_word_model: "https://github.com/OHF-Voice/micro-wake-word/releases/download/v2.1_models/hey_jarvis.json"
+  # DEFAULT WAKE WORD: "HEY LEONARD" — a custom model trained by this project
+  # (see models/ and the README). Switch to Hey Jarvis / Okay Nabu at runtime
+  # via the device's "Wake word" dropdown in Home Assistant — no reflash.
+  wake_word_model: "github://TristanBrotherton/voicepe-realtime-firmware/models/hey_leonard.json@main"
+  default_wake_word: "Hey Leonard"
   # Runtime sensitivity cutoffs (uint8 = round(p*255)) for Slightly/Moderately/
   # Very. Stock-model defaults; custom models override with calibrated values.
   wake_cutoff_slight: '217'
@@ -1274,6 +1278,16 @@ script:
   # Master script controlling the LEDs, based on different conditions : initialization in progress, wifi and api connected and voice assistant phase.
   # For the sake of simplicity and re-usability, the script calls child scripts defined below.
   # This script will be called every time one of these conditions is changing.
+  - id: apply_wake_word_selection
+    then:
+      - micro_wake_word.disable_model: alexa
+      - micro_wake_word.disable_model: wake_jarvis
+      - micro_wake_word.disable_model: wake_nabu
+      - lambda: |-
+          auto s = id(wake_word_select).state;
+          if (s == "Hey Jarvis") { id(wake_jarvis)->enable(); }
+          else if (s == "Okay Nabu") { id(wake_nabu)->enable(); }
+          else { id(alexa)->enable(); }
   - id: control_leds
     then:
       - lambda: |
@@ -2032,6 +2046,8 @@ va_client:
           lambda: 'return phase == "enrolling";'
         then:
           - micro_wake_word.disable_model: alexa
+          - micro_wake_word.disable_model: wake_jarvis
+          - micro_wake_word.disable_model: wake_nabu
           - micro_wake_word.disable_model: stop
           - script.stop: followup_window_watchdog
     - if:
@@ -2039,8 +2055,8 @@ va_client:
           lambda: 'return phase == "idle";'
         then:
           - micro_wake_word.start:
-          # Re-enable the start word (a no-op except after enrollment disabled it).
-          - micro_wake_word.enable_model: alexa
+          # Re-enable the SELECTED start word (no-op unless enrollment disabled it).
+          - script.execute: apply_wake_word_selection
     # Arm "stop" for the WHOLE reply AND through the follow-up listening window —
     # not just while the backend says "replying". Two reasons:
     #  1) The backend bursts the reply; the device keeps playing the audio TAIL
@@ -2169,7 +2185,11 @@ micro_wake_word:
     # so the sensitivity select keeps working. To use a stock wake word instead:
     # https://github.com/OHF-Voice/micro-wake-word/releases/download/v2.1_models/hey_jarvis.json
     - model: ${wake_word_model}
-      id: alexa
+      id: alexa   # primary (historical id kept — scripts reference it)
+    - model: https://github.com/OHF-Voice/micro-wake-word/releases/download/v2.1_models/hey_jarvis.json
+      id: wake_jarvis
+    - model: https://github.com/OHF-Voice/micro-wake-word/releases/download/v2.1_models/okay_nabu.json
+      id: wake_nabu
     - model: https://github.com/OHF-Voice/micro-wake-word/releases/download/stop/stop.json
       id: stop
       internal: true
@@ -2380,6 +2400,19 @@ micro_wake_word:
                                   - script.execute: control_leds
 
 select:
+  - platform: template
+    name: "Wake word"
+    id: wake_word_select
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_option: ${default_wake_word}
+    options:
+      - "Hey Leonard"
+      - "Hey Jarvis"
+      - "Okay Nabu"
+    on_value:
+      - script.execute: apply_wake_word_selection
   - platform: template
     name: "Wake word sensitivity"
     id: wake_word_sensitivity
