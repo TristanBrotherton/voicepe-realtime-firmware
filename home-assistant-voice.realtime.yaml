@@ -32,6 +32,15 @@ substitutions:
   voice_assist_replying_phase_id: '5'
   # The device is in voice-enrollment mode (fork): mic pinned open, recording
   voice_assist_enrolling_phase_id: '6'
+  # Wake-word model. DEFAULT = stock "hey jarvis" so new installs work for
+  # everyone. Train your own (see README "How wake-word training works") and
+  # override in your per-device stub — ours points at models/hey_leonard.json.
+  wake_word_model: "https://github.com/OHF-Voice/micro-wake-word/releases/download/v2.1_models/hey_jarvis.json"
+  # Runtime sensitivity cutoffs (uint8 = round(p*255)) for Slightly/Moderately/
+  # Very. Stock-model defaults; custom models override with calibrated values.
+  wake_cutoff_slight: '217'
+  wake_cutoff_moderate: '178'
+  wake_cutoff_very: '140'
   # The voice assistant is not ready
   voice_assist_not_ready_phase_id: '10'
   # The voice assistant encountered an error
@@ -2159,7 +2168,7 @@ micro_wake_word:
     # 0.93 false-accepts/hour, cutoff 0.43, sliding window 3). id stays `alexa`
     # so the sensitivity select keeps working. To use a stock wake word instead:
     # https://github.com/OHF-Voice/micro-wake-word/releases/download/v2.1_models/hey_jarvis.json
-    - model: github://TristanBrotherton/voicepe-realtime-firmware/models/hey_leonard.json@main
+    - model: ${wake_word_model}
       id: alexa
     - model: https://github.com/OHF-Voice/micro-wake-word/releases/download/stop/stop.json
       id: stop
@@ -2392,11 +2401,11 @@ select:
       # accepts. Spacing mirrors the proven okay_nabu tiers.
       lambda: |-
         if (x == "Slightly sensitive") {
-          id(alexa).set_probability_cutoff(153);   // ~0.60 (v3 model) (LOCAL EDIT: remapped for hey_leonard, calibrated 0.43)
+          id(alexa).set_probability_cutoff(${wake_cutoff_slight});
         } else if (x == "Moderately sensitive") {
-          id(alexa).set_probability_cutoff(181);   // ~0.71 = v3 calibrated cutoff
+          id(alexa).set_probability_cutoff(${wake_cutoff_moderate});
         } else if (x == "Very sensitive") {
-          id(alexa).set_probability_cutoff(153);   // ~0.60 (v3 model)
+          id(alexa).set_probability_cutoff(${wake_cutoff_very});
         }
 
 
