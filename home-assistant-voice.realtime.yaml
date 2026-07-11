@@ -551,6 +551,9 @@ binary_sensor:
                     id: play_sound
                     priority: false
                     sound_file: "center_button_double_press_sound"
+                # Double-press = explicit "that was a false wake" flag: works
+                # regardless of whether the assistant already replied.
+                - lambda: 'id(va)->send_false_flag();
                 - event.trigger:
                     id: button_press_event
                     event_type: "double_press"
@@ -2079,16 +2082,10 @@ va_client:
           - lambda: 'id(stop).set_probability_cutoff(102);'
           - script.execute: followup_window_watchdog
   on_repeated_failure:
-    # Backend has been unreachable for N reconnect attempts in a row.
-    # Play the error chime once so the user knows something's wrong —
-    # the LED is already in no_ha_connection (red twinkle) but that's
-    # easy to miss across the room.
-    - script.execute:
-        id: play_sound
-        priority: true
-        # audio_file id is `error_cloud_expired` (no "_sound" suffix),
-        # unlike the other chimes — original yaml inconsistency.
-        sound_file: "error_cloud_expired"
+    # Backend unreachable for N reconnect attempts. SILENT by design (was a
+    # loud announcement — it fired at night and woke the household). The
+    # no_ha_connection red twinkle is the sole indicator.
+    - script.execute: control_leds
   on_followup_opened:
     # Server's request_follow_up tool fired and va_client has waited
     # for the TTS hardware tail to clear (kTtsTailMs ≈ 800 ms after the

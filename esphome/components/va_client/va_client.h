@@ -72,6 +72,8 @@ class VaClient : public Component {
   // Sent when the user silences an active session with the center button —
   // the backend treats a fast button-cancel after a wake as a false-wake flag.
   void send_button_cancel();
+  // Double-press: explicit false-wake flag, any time.
+  void send_false_flag();
   bool enroll_active() const { return this->enroll_mode_; }
   void send_interrupt();
   // Called from yaml's on_followup_opened automation AFTER the chime has
