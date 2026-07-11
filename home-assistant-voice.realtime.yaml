@@ -508,6 +508,10 @@ binary_sensor:
                                         lambda: 'return id(voice_assistant_phase) != ${voice_assist_idle_phase_id};'
                                       then:
                                         - lambda: 'id(va)->send_interrupt();'
+                                        # Fast button-silence after a wake = the
+                                        # user shutting up a false trigger; tell
+                                        # the backend so it can flag the capture.
+                                        - lambda: 'id(va)->send_button_cancel();'
                                         - speaker.stop:
                                             id: media_resampling_speaker
                                         - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
