@@ -381,8 +381,12 @@ switch:
   # Internal switch to track when a timer is ringing on the device.
   - platform: template
     id: timer_ringing
+    name: "Timer ringing"
     optimistic: true
-    internal: true
+    # Exposed to HA (was internal): the Voice PE Realtime backend's timer
+    # feature turns this ON at timer expiry — the device then plays the stock
+    # timer chime + LED until the button, "stop", or the backend turns it off.
+    internal: false
     restore_mode: ALWAYS_OFF
     on_turn_off:
       # Disable stop wake word
