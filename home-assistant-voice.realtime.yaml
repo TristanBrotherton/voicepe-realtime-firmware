@@ -572,8 +572,17 @@ binary_sensor:
                     priority: false
                     sound_file: "center_button_double_press_sound"
                 # Double-press = explicit "that was a false wake" flag: works
-                # regardless of whether the assistant already replied.
+                # regardless of whether the assistant already replied. Flagging
+                # also ENDS the session — the user just declared the wake false,
+                # so there is nothing to keep conversing about (observed live:
+                # a radio-triggered session kept chatting for 17s after the
+                # flag until a separate single-press stopped it).
                 - lambda: 'id(va)->send_false_flag();'
+                - lambda: 'id(va)->send_interrupt();'
+                - speaker.stop:
+                    id: media_resampling_speaker
+                - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+                - script.execute: control_leds
                 - event.trigger:
                     id: button_press_event
                     event_type: "double_press"
