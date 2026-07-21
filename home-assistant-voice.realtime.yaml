@@ -1320,7 +1320,7 @@ script:
       - micro_wake_word.disable_model: wake_jarvis
       - micro_wake_word.disable_model: wake_nabu
       - lambda: |-
-          auto s = id(wake_word_select).state;
+          auto s = id(wake_word_select).current_option();
           if (s == "Hey Jarvis") { id(wake_jarvis)->enable(); }
           else if (s == "Okay Nabu") { id(wake_nabu)->enable(); }
           else { id(alexa)->enable(); }
