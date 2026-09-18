@@ -292,6 +292,10 @@ class VaClient : public Component {
   // Touched by handle_binary_ (WS task, arms it) + loop() (main task, releases);
   // plain flag like streaming_, the tiny race is harmless.
   bool playback_priming_{false};
+  // True after the first real PCM bytes of this turn have been accepted by
+  // the speaker chain. The startup prebuffer is a once-per-turn cushion; it
+  // must not re-arm every time the PSRAM producer ring briefly becomes empty.
+  bool reply_audio_started_this_turn_{false};
   // millis() when priming started (first byte after the ring was empty); used
   // for the prime deadline so real-time (non-burst) audio still starts promptly.
   uint32_t prime_started_ms_{0};
@@ -318,6 +322,16 @@ class VaClient : public Component {
   // millis() of the last time we fed the resampler ANYTHING (silence or real).
   // Used to detect a cold chain: now - last_fed_ms_ > kChainColdMs. 0 = never fed.
   uint32_t last_fed_ms_{0};
+  // Mid-reply silence keepalive. OpenAI may intentionally pause audio while a
+  // tool runs even though phase remains REPLYING. If the downstream chain is
+  // allowed to drain completely, the next PCM burst can arrive to a dry
+  // resampler/mixer/i2s path and produce the observed stutter/rasp. Feed one
+  // real-time-paced 10 ms zero frame while the reply is active and the PSRAM
+  // ring is empty. This keeps the chain warm without fabricating speech or
+  // building an unbounded silence queue.
+  static constexpr uint32_t kReplyKeepaliveMs = 10;
+  uint32_t reply_keepalive_next_ms_{0};
+  uint32_t reply_keepalive_frames_this_turn_{0};
   // Legacy compile-time default, kept for reference. The live value now comes
   // from the backend (followup_ms_); this stays 0 so a device talking to an
   // old backend that doesn't send follow_up_ms keeps the turn-based behaviour.

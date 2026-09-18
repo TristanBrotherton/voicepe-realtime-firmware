@@ -170,9 +170,15 @@ void VaClient::loop() {
       // brief stuck-sample glitch. Log the first occurrence per reply so
       // we know whether bad audio in a turn correlates with this.
       if (!this->underrun_logged_this_turn_ && !this->speaker_->has_buffered_data()) {
-        ESP_LOGW(TAG, "downstream underrun: %u bytes queued in PSRAM but speaker chain is dry",
-                 (unsigned) fill);
-        this->underrun_logged_this_turn_ = true;
+        // At reply startup the resampler/mixer counters can already be empty
+        // while the cold-prime silence is sitting farther downstream in the
+        // I2S leaf buffer. That is not an audible underrun. Only flag a dry
+        // chain after real reply audio has started.
+        if (this->reply_audio_started_this_turn_) {
+          ESP_LOGW(TAG, "downstream underrun: %u bytes queued in PSRAM but speaker chain is dry",
+                   (unsigned) fill);
+          this->underrun_logged_this_turn_ = true;
+        }
       }
       // Contiguous slice we can hand to play() without copying: from head
       // to either the end of the buffer or the tail.
@@ -185,6 +191,8 @@ void VaClient::loop() {
       size_t accepted = this->speaker_->play(this->audio_buf_ + head, contiguous);
       if (accepted > 0) {
         this->last_fed_ms_ = millis();  // keep the chain "warm" for cold-detection
+        this->reply_keepalive_next_ms_ = this->last_fed_ms_ + kReplyKeepaliveMs;
+        this->reply_audio_started_this_turn_ = true;
         portENTER_CRITICAL(&this->ring_mux_);
         this->audio_head_ = (this->audio_head_ + accepted) % kAudioBufBytes;
         this->audio_fill_ -= accepted;
@@ -195,6 +203,31 @@ void VaClient::loop() {
           ESP_LOGD(TAG, "drained %u bytes (%u still queued)", (unsigned) accepted,
                    (unsigned) (fill - accepted));
           dbg_last = now;
+        }
+      }
+    } else {
+      // Keep the downstream audio path alive across intentional mid-reply
+      // gaps (notably tool calls). The old behavior fed nothing while the
+      // PSRAM ring was empty; a long gap let the resampler/mixer/i2s path run
+      // dry, so the next real burst restarted into an underrun and sounded
+      // distorted. Pace zero PCM at the playback rate only while the server
+      // still says REPLYING. Stop immediately on idle/listening/interrupt.
+      const Phase phase_now = static_cast<Phase>(this->current_phase_.load());
+      const uint32_t now_ms = millis();
+      if (phase_now == Phase::REPLYING && !this->suppress_incoming_audio_ &&
+          !this->post_stop_guard_ &&
+          (this->reply_keepalive_next_ms_ == 0 ||
+           static_cast<int32_t>(now_ms - this->reply_keepalive_next_ms_) >= 0)) {
+        static const uint8_t kReplySilence[
+            kReplyKeepaliveMs * (kPlaybackSampleRate / 1000) * 2] = {0};
+        const size_t accepted = this->speaker_->play(kReplySilence, sizeof(kReplySilence));
+        if (accepted > 0) {
+          this->last_fed_ms_ = now_ms;
+          this->reply_keepalive_next_ms_ = now_ms + kReplyKeepaliveMs;
+          this->reply_keepalive_frames_this_turn_++;
+        } else {
+          // Downstream is full; retry soon without spinning every loop tick.
+          this->reply_keepalive_next_ms_ = now_ms + 1;
         }
       }
     }
@@ -632,7 +665,8 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
   // nothing but spam "prebuffer ready" every ~50 ms and could hold a small
   // trailing chunk for the full prebuffer deadline. has_buffered_data() is a
   // counter read, safe enough from the WS task. Only when enabled.
-  if (was_empty && this->playback_prebuffer_ms_ > 0 && !this->playback_priming_ &&
+  if (was_empty && !this->reply_audio_started_this_turn_ &&
+      this->playback_prebuffer_ms_ > 0 && !this->playback_priming_ &&
       !this->speaker_->has_buffered_data()) {
     this->prime_started_ms_ = now_ms;
     this->playback_priming_ = true;
@@ -750,6 +784,9 @@ void VaClient::set_phase_(const std::string &phase) {
   // changed since the last emission.
   const Phase prev = static_cast<Phase>(this->current_phase_.load());
   this->current_phase_.store(static_cast<uint8_t>(phase_from_string_(phase)));
+  if (phase != "replying") {
+    this->reply_keepalive_next_ms_ = 0;
+  }
   ESP_LOGD(TAG, "Phase -> %s", phase.c_str());
 
   // Post-stop `thinking` guard. After a local "stop" the mic gate is closed
@@ -1046,6 +1083,9 @@ void VaClient::start_session() {
   this->ws_gap_max_ms_ = 0;
   this->clipped_samples_ = 0;
   this->underrun_logged_this_turn_ = false;
+  this->reply_audio_started_this_turn_ = false;
+  this->reply_keepalive_next_ms_ = 0;
+  this->reply_keepalive_frames_this_turn_ = 0;
   // Watchdog: if server doesn't hear us within kNoSpeechTimeoutMs, abort the
   // session so we're not stuck with the mic open after a misfire.
   this->set_timeout("va_no_speech", kNoSpeechTimeoutMs, [this]() {
@@ -1099,13 +1139,15 @@ void VaClient::open_followup_window_(uint32_t duration_ms) {
       // Audio-quality summary: only logged if anything anomalous fired.
       // A clean turn produces no line — keeps the noise floor low.
       if (this->ws_gap_count_ > 0 || this->clipped_samples_ > 0 ||
-          this->underrun_logged_this_turn_) {
+          this->underrun_logged_this_turn_ || this->reply_keepalive_frames_this_turn_ > 0) {
         ESP_LOGW(TAG,
-                 "turn audio: ws_gaps=%u (max=%ums) clipped_samples=%u underrun=%s",
+                 "turn audio: ws_gaps=%u (max=%ums) clipped_samples=%u underrun=%s "
+                 "reply_keepalive_frames=%u",
                  (unsigned) this->ws_gap_count_,
                  (unsigned) this->ws_gap_max_ms_,
                  (unsigned) this->clipped_samples_,
-                 this->underrun_logged_this_turn_ ? "yes" : "no");
+                 this->underrun_logged_this_turn_ ? "yes" : "no",
+                 (unsigned) this->reply_keepalive_frames_this_turn_);
       }
       this->turn_t_wake_ = 0;  // mark turn as logged
     }
