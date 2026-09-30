@@ -2216,8 +2216,9 @@ micro_wake_word:
     # word, armed only while the assistant is replying (see on_phase below).
     # FORK EDIT: custom-trained "hey leonard" microWakeWord model (see models/ in
     # this repo: 50k dual-accent synthetic positives en_US-libritts_r + en_GB-vctk,
-    # 4k confusable negatives, 70k training steps; calibrated recall 97.7% at
-    # 0.93 false-accepts/hour, cutoff 0.43, sliding window 3). id stays `alexa`
+    # real wake repetitions, reviewed household-speech negatives, and confirmed
+    # false wakes; calibrated recall 97.49% at 0.827 false-accepts/hour, cutoff
+    # 0.64, sliding window 3. id stays `alexa`
     # so the sensitivity select keeps working. To use a stock wake word instead:
     # https://github.com/OHF-Voice/micro-wake-word/releases/download/v2.1_models/hey_jarvis.json
     - model: ${wake_word_model}
