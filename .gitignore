@@ -142,5 +142,23 @@ sdkconfig.*
 
 /components
 
+# Household audio, recordings and trainer outputs never belong in this public
+# repository. Shipped sounds live in sounds/; wake models (with their
+# metrics-only eval manifests) live in models/ and are released deliberately.
+*.wav
+*.flac
+!sounds/*.flac
+*.m4a
+*.ogg
+*.opus
+*.webm
+*.npy
+*.npz
+voice-samples/
+recordings/
+enrollment*/
+detection_calibration.json
+build/ci/
+
 # ESPHome secrets (per-device credentials, do not commit)
 secrets.yaml

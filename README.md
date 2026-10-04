@@ -26,7 +26,17 @@ You don't build anything by hand for a normal install — the per-device stub
 this repo as a remote package, and ESPHome Builder compiles and flashes it (one
 click for updates). To hack on the firmware itself, point the stub's `packages:`
 block at your fork/branch instead. Wake-word models live in
-[`models/`](models/) (previous model kept in `models/previous/` for rollback).
+[`models/`](models/) with metrics-only evaluation manifests and the release
+gate ([`models/README.md`](models/README.md)); the previous model is kept in
+`models/previous/` for rollback.
+
+CI ([`.github/workflows/realtime.yml`](.github/workflows/realtime.yml)) compiles
+this realtime firmware from the checkout under review
+(`tools/ci/make_ci_config.py`), runs the wake-word gate and consistency checks
+(`tools/wakeword/`), lints the YAML, and scans for private data.
+
+The [`static/`](static/) web installer restores the **stock** firmware; it does
+not install Voice PE Realtime.
 
 ---
 *Based on / inspired by xandervanerven's and maxmaxme's Voice PE work and the

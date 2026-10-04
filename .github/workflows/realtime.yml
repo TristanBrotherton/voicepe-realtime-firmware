@@ -1,0 +1,81 @@
+name: Realtime firmware
+
+# Builds the Voice PE Realtime firmware itself (build.yml only builds the
+# upstream stock configs) and enforces the wake-word release gate.
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - "remediation/**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Wake-word gate, YAML lint, public scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history — the model pin is verified against it)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Wake-word tooling tests
+        run: python -m unittest discover -s tools/wakeword/tests -v
+
+      - name: Wake-word release consistency (model, manifest, firmware, pin)
+        run: python tools/wakeword/check_release.py --git
+
+      - name: Public-surface scan
+        run: python tools/ci/public_scan.py
+
+      - name: YAML lint
+        run: |
+          python -m pip install --quiet yamllint==1.37.1
+          yamllint -c .yamllint home-assistant-voice.realtime.yaml packages/ esphome-builder.dhcp.yaml esphome-builder.static-ip.yaml
+
+  build:
+    name: Compile home-assistant-voice.realtime.yaml
+    runs-on: ubuntu-latest
+    needs: checks
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Cache PlatformIO / ESP-IDF toolchains
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: |
+            ~/.platformio
+            ~/.esphome
+          key: esphome-2026.9.0-${{ runner.os }}
+
+      - name: Install ESPHome (the version the firmware is tested with)
+        run: python -m pip install --quiet esphome==2026.9.0
+
+      - name: Generate a config that builds THIS checkout (local va_client + model)
+        run: python tools/ci/make_ci_config.py build/ci
+
+      - name: Validate
+        run: esphome config build/ci/voice-pe-ci.yaml > /dev/null
+
+      - name: Compile
+        run: esphome compile build/ci/voice-pe-ci.yaml
