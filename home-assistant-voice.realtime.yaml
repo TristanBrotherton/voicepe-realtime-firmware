@@ -35,13 +35,33 @@ substitutions:
   # DEFAULT WAKE WORD: "HEY LEONARD" — a custom model trained by this project
   # (see models/ and the README). Switch to Hey Jarvis / Okay Nabu at runtime
   # via the device's "Wake word" dropdown in Home Assistant — no reflash.
-  wake_word_model: "github://TristanBrotherton/voicepe-realtime-firmware/models/hey_leonard.json@main"
+  # Pinned to an immutable commit: a model change is a deliberate release
+  # (new files, then a new pin), never a silent "@main" drift. CI checks the
+  # pin, the sha256 and the window below against models/ and its eval manifest.
+  wake_word_model: "github://TristanBrotherton/voicepe-realtime-firmware/models/hey_leonard.json@e56ee1259c09de6557cea571327b82bbf0928109"
   default_wake_word: "Hey Leonard"
-  # Runtime sensitivity cutoffs (uint8 = round(p*255)) for Slightly/Moderately/
-  # Very. Stock-model defaults; custom models override with calibrated values.
-  wake_cutoff_slight: '217'
-  wake_cutoff_moderate: '178'
-  wake_cutoff_very: '140'
+  # Identity of the packaged model, reported to Home Assistant and the add-on.
+  wake_model_name: "hey_leonard"
+  wake_model_sha256: "8418e780218ccb4fcac490f0fe3952abbfaa86b49636ed5e1ce2dd48a4548e7c"
+  wake_model_window: "3"
+  # "Wake word sensitivity" tiers for the custom model, as uint8 cutoffs
+  # (round(p * 255), LOWER = more sensitive). "auto" derives them from the
+  # model's own calibrated cutoff (its manifest), so calibration and runtime
+  # can never disagree:
+  #   Slightly sensitive   = the calibrated cutoff (gate-validated default)
+  #   Moderately sensitive = calibrated - wake_cutoff_moderate_delta
+  #   Very sensitive       = calibrated - wake_cutoff_very_delta
+  # The deltas come from models/hey_leonard.eval.json (more sensitive tiers sit
+  # outside the validated false-accept budget). A number overrides "auto".
+  wake_cutoff_slight: "auto"
+  wake_cutoff_moderate: "auto"
+  wake_cutoff_very: "auto"
+  wake_cutoff_moderate_delta: "18"
+  wake_cutoff_very_delta: "33"
+  default_wake_sensitivity: "Slightly sensitive"
+  # Optional log-only candidate model (packages/wake-word-shadow.yaml): its
+  # wake word name. Detections are reported, never start a session.
+  shadow_wake_word: "__no_shadow_model__"
   # The voice assistant is not ready
   voice_assist_not_ready_phase_id: '10'
   # The voice assistant encountered an error
@@ -71,9 +91,16 @@ substitutions:
   # add-on (this fork's backend). The add-on runs with host_network and
   # listens on port 8080. homeassistant.local resolves via mDNS on the LAN;
   # change this if your HA host has a different name/IP, e.g.
-  # "ws://192.168.1.10:8080/".
+  # "ws://192.0.2.10:8080/".
   va_url: "ws://homeassistant.local:8080/"
-  # (device→add-on WebSocket needs no auth token; it's a LAN-local service.)
+  # Shared secret for the add-on's device_token option (sent as an
+  # Authorization header). Empty = no token, for add-ons without one.
+  va_token: ""
+  # Git ref the va_client C++ is fetched from. Pin it to the same tag/commit as
+  # this package for reproducible builds.
+  va_client_ref: "main"
+  # Firmware version reported to Home Assistant and in the wake message.
+  fw_version: "1.3.0"
 
 esphome:
   name: ${name}
@@ -83,7 +110,7 @@ esphome:
   # `version` on a release (merge to main) and adopted devices are offered it.
   project:
     name: "tristanbrotherton.voice-pe-openai-realtime"
-    version: "1.2.0"
+    version: "${fw_version}"
   min_version: 2026.5.0
   on_boot:
     priority: 375
@@ -181,7 +208,6 @@ logger:
   logs:
     sensor: WARN  # avoids logging debug sensor updates
 
-
 ota:
   - platform: esphome
     id: ota_esphome
@@ -240,6 +266,13 @@ text_sensor:
         case ${voice_assist_error_phase_id}: return std::string("error");
         default: return std::string("unknown");
       }
+  # Which wake model the device runs and at which operating point (model,
+  # sha256 prefix, cutoff, window, tier). Published by apply_wake_sensitivity.
+  - platform: template
+    name: "Wake word operating point"
+    id: wake_operating_point
+    entity_category: diagnostic
+    update_interval: never
 
 # va-direct: WiFi provisioning blocks moved out of factory.yaml into the main
 # config since we don't use the upstream two-tier factory build.
@@ -335,6 +368,20 @@ globals:
     initial_value: 'false'
 
 switch:
+  # Opt-in: send the ~1.5 s BEFORE a wake (the sound that triggered it) to the
+  # add-on for false-wake review. Also requires the add-on's trigger_capture
+  # option; audio stays on the Home Assistant host. Off by default.
+  - platform: template
+    id: share_trigger_audio
+    name: "Share wake trigger audio"
+    icon: "mdi:waveform"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - lambda: 'id(va)->set_trigger_capture_enabled(true);'
+    on_turn_off:
+      - lambda: 'id(va)->set_trigger_capture_enabled(false);'
   # This is the master mute switch. It is exposed to Home Assistant. The user can only turn it on and off if the hardware switch is off. (The hardware switch overrides the software one)
   - platform: template
     id: master_mute_switch
@@ -554,6 +601,7 @@ binary_sensor:
                                                   condition:
                                                     switch.is_off: master_mute_switch
                                                   then:
+                                                    - lambda: 'id(va)->note_wake_fired(true);'
                                                     - script.execute:
                                                         id: play_sound
                                                         priority: true
@@ -564,7 +612,9 @@ binary_sensor:
                                                             media_player.is_announcing:
                                                               id: external_media_player
                                                         timeout: 2s
-                                                    - delay: 600ms
+                                                    # Same tunable echo guard as the wake-word
+                                                    # path (wake_open_delay_ms from the add-on).
+                                                    - delay: !lambda "return id(va)->get_wake_open_delay_ms();"
                                                     - lambda: 'id(va)->start_session();'
                                                     - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
                                                     - script.execute: control_leds
@@ -1252,6 +1302,13 @@ power_supply:
     pin: GPIO45
 
 sensor:
+  # Active wake-word probability cutoff (0-1) — see "Wake word operating point".
+  - platform: template
+    name: "Wake word cutoff"
+    id: wake_cutoff_sensor
+    entity_category: diagnostic
+    accuracy_decimals: 2
+    update_interval: never
   # The dial. Used to control volume and Hue of the LED ring.
   - platform: rotary_encoder
     id: dial
@@ -1324,6 +1381,56 @@ script:
           if (s == "Hey Jarvis") { id(wake_jarvis)->enable(); }
           else if (s == "Okay Nabu") { id(wake_nabu)->enable(); }
           else { id(alexa)->enable(); }
+      - script.execute: apply_wake_sensitivity
+  # Applies the "Wake word sensitivity" tier to EVERY wake model (it used to
+  # touch only the custom model, and with fixed numbers that no longer matched
+  # its calibration), then reports the active operating point to Home
+  # Assistant and to the add-on (wake protocol v2).
+  - id: apply_wake_sensitivity
+    then:
+      - lambda: |-
+          const std::string tier = id(wake_word_sensitivity).current_option();
+          const std::string word = id(wake_word_select).current_option();
+          auto pick = [&](int slight, int moderate, int very) {
+            if (tier == "Very sensitive") return very;
+            if (tier == "Moderately sensitive") return moderate;
+            return slight;
+          };
+          auto setting = [](const char *raw, int fallback) {
+            const std::string v(raw);
+            if (v.empty() || v == "auto") return fallback;
+            const int n = atoi(v.c_str());
+            return (n >= 1 && n <= 255) ? n : fallback;
+          };
+          // Custom model: auto tiers are relative to its calibrated cutoff.
+          const int cal = id(alexa).get_default_probability_cutoff();
+          const int custom = pick(setting("${wake_cutoff_slight}", cal),
+                                  setting("${wake_cutoff_moderate}", std::max(1, cal - ${wake_cutoff_moderate_delta})),
+                                  setting("${wake_cutoff_very}", std::max(1, cal - ${wake_cutoff_very_delta})));
+          id(alexa).set_probability_cutoff(custom);
+          // Stock v2.1 models: manifest default, then upstream-style steps.
+          const int jd = id(wake_jarvis).get_default_probability_cutoff();
+          const int jarvis = pick(jd, std::max(1, jd - 12), std::max(1, jd - 35));
+          id(wake_jarvis).set_probability_cutoff(jarvis);
+          const int nd = id(wake_nabu).get_default_probability_cutoff();
+          const int nabu = pick(nd, std::max(1, nd - 12), std::max(1, nd - 35));
+          id(wake_nabu).set_probability_cutoff(nabu);
+          // Report what the ACTIVE model really runs.
+          std::string model = "${wake_model_name}";
+          std::string sha = std::string("${wake_model_sha256}").substr(0, 8);
+          int cutoff = custom;
+          int window = ${wake_model_window};
+          int calibrated = cal;
+          if (word == "Hey Jarvis") { model = "hey_jarvis_v2.1"; sha = "stock"; cutoff = jarvis; window = 5; calibrated = jd; }
+          else if (word == "Okay Nabu") { model = "okay_nabu_v2.1"; sha = "stock"; cutoff = nabu; window = 5; calibrated = nd; }
+          const std::string short_tier = tier == "Very sensitive" ? "very" : (tier == "Moderately sensitive" ? "moderate" : "slight");
+          id(va)->set_wake_info(model, sha, cutoff, window, short_tier);
+          char buf[160];
+          snprintf(buf, sizeof(buf), "%s %s cutoff %.2f (%d) window %d, %s%s", model.c_str(), sha.c_str(),
+                   cutoff / 255.0f, cutoff, window, tier.c_str(), cutoff == calibrated ? " (calibrated)" : "");
+          id(wake_operating_point).publish_state(buf);
+          id(wake_cutoff_sensor).publish_state(cutoff / 255.0f);
+          ESP_LOGI("wake_word", "operating point: %s", buf);
   - id: control_leds
     then:
       - lambda: |
@@ -1985,7 +2092,6 @@ media_source:
     id: sendspin_media_source
     fixed_delay: 480 microseconds  # The AIC3204 DAC used, as configured, on the VPE delays audio by 480 microseconds
 
-
 voice_kit:
   id: voice_kit_component
   i2c_id: internal_i2c
@@ -2013,7 +2119,7 @@ external_components:
   - source:
       type: git
       url: https://github.com/TristanBrotherton/voicepe-realtime-firmware
-      ref: main
+      ref: ${va_client_ref}
     components: [va_client]
     refresh: 0s
 
@@ -2037,6 +2143,8 @@ time:
 va_client:
   id: va
   url: ${va_url}
+  token: ${va_token}
+  firmware_version: ${fw_version}
   microphone: i2s_mics
   mic_channel: 0
   # Handsfree barge-in: keep the mic open while the assistant is speaking so
@@ -2149,6 +2257,13 @@ va_client:
     # loud announcement — it fired at night and woke the household). The
     # no_ha_connection red twinkle is the sole indicator.
     - script.execute: control_leds
+  on_audible_error:
+    # A turn the USER started failed and the add-on could not explain it out
+    # loud: play the error chime (never fires without a user-initiated turn).
+    - script.execute:
+        id: play_sound
+        priority: true
+        sound_file: "error_cloud_expired"
   on_followup_opened:
     # Server's request_follow_up tool fired and va_client has waited
     # for the TTS hardware tail to clear (kTtsTailMs ≈ 800 ms after the
@@ -2215,11 +2330,10 @@ micro_wake_word:
     # removed on purpose. "stop" stays — it's the reliable barge-in/interrupt
     # word, armed only while the assistant is replying (see on_phase below).
     # FORK EDIT: custom-trained "hey leonard" microWakeWord model (see models/ in
-    # this repo: 50k dual-accent synthetic positives en_US-libritts_r + en_GB-vctk,
-    # real wake repetitions, reviewed household-speech negatives, and confirmed
-    # false wakes; calibrated recall 97.49% at 0.827 false-accepts/hour, cutoff
-    # 0.64, sliding window 3. id stays `alexa`
-    # so the sensitivity select keeps working. To use a stock wake word instead:
+    # this repo and models/hey_leonard.eval.json for its metrics-only
+    # evaluation manifest: calibrated cutoff 0.64, sliding window 3, recall
+    # 0.9749 and 0.827 false accepts/hour on the trainer's validation sets).
+    # id stays `alexa` (scripts reference it). To use a stock wake word instead:
     # https://github.com/OHF-Voice/micro-wake-word/releases/download/v2.1_models/hey_jarvis.json
     - model: ${wake_word_model}
       id: alexa   # primary (historical id kept — scripts reference it)
@@ -2259,24 +2373,35 @@ micro_wake_word:
   vad:
     probability_cutoff: 0.3
   on_wake_word_detected:
+    # A log-only candidate model (packages/wake-word-shadow.yaml) reports its
+    # detection to the add-on and does nothing else (not even during voice
+    # enrollment, whose deliberate repetitions would skew its statistics).
+    - if:
+        condition:
+          lambda: 'return wake_word == "${shadow_wake_word}" && !id(va)->enroll_active();'
+        then:
+          - lambda: 'id(va)->send_shadow_detection(wake_word);'
     # Instant wake pulse — before any guards, exactly "the model fired".
     # (The delayed reset lives in wake_pulse_reset; an inline delay here
     # would stall the wake handling below.)
-    - binary_sensor.template.publish:
-        id: wake_detected_pulse
-        state: true
-    - script.execute: wake_pulse_reset
-    # TEMP DEBUG (va-direct): log EVERY detection BEFORE the mute guard, so the
-    # next flash's log tells "mWW never fired" (mic/XMOS problem) apart from
-    # "fired but swallowed by the mute switch". Remove once wake word is confirmed.
-    - logger.log:
-        format: "WAKE fired: '%s' (muted=%d)"
-        args: ['wake_word.c_str()', 'id(master_mute_switch).state']
-        level: WARN
+    - if:
+        condition:
+          lambda: 'return wake_word != "${shadow_wake_word}";'
+        then:
+          - binary_sensor.template.publish:
+              id: wake_detected_pulse
+              state: true
+          - script.execute: wake_pulse_reset
+          - logger.log:
+              format: "wake word '%s' fired (muted=%d)"
+              args: ['wake_word.c_str()', 'id(master_mute_switch).state']
+              level: INFO
     # If the wake word is detected when the device is muted (Possible with the software mute switch): Do nothing
     - if:
         condition:
-          switch.is_off: master_mute_switch
+          and:
+            - switch.is_off: master_mute_switch
+            - lambda: 'return wake_word != "${shadow_wake_word}";'
         then:
           # If a timer is ringing: Stop it, do not start the voice assistant (We can stop timer from voice!)
           - if:
@@ -2330,9 +2455,13 @@ micro_wake_word:
                                 args: ['id(voice_assistant_phase)']
                                 level: INFO
                     else:
-                      # Non-stop wake word: branch on the assistant's current
-                      # phase. Wake fired while replying = barge-in (interrupt
-                      # the reply); idle/listening/thinking → fresh session.
+                      # Non-stop wake word: stamp the detection first. The wake
+                      # message reports how long chime + echo guard took (fire
+                      # -> mic open) and, when opted in, carries the trigger audio.
+                      - lambda: 'id(va)->note_wake_fired(false);'
+                      # Branch on the assistant's current phase. Wake fired while
+                      # replying = barge-in (interrupt the reply);
+                      # idle/listening/thinking → fresh session.
                       - if:
                           condition:
                             lambda: 'return id(voice_assistant_phase) == ${voice_assist_replying_phase_id};'
@@ -2399,15 +2528,16 @@ micro_wake_word:
                                       sound_file: "error_cloud_expired"
                                 else:
                                   # Regular wake word: play wake chime, start a new session.
-                                  # Stop the TTS playback chain first. The previous turn may
-                                  # still have downstream ring residual (~600 ms) even after
-                                  # the server said phase=idle — start_session()'s internal
-                                  # send_interrupt() flushes the PSRAM queue, but the leaf's
-                                  # own ring buffers it can't reach. Without this stop the
-                                  # tail of the old reply leaks under the wake chime.
-                                  # No-op when there's nothing playing.
-                                  - speaker.stop:
-                                      id: media_resampling_speaker
+                                  # Stop the TTS playback chain only when it still holds
+                                  # audio (a previous reply's ~600 ms downstream residual
+                                  # would leak under the chime). Stopping an idle chain
+                                  # forced a cold resampler start on the next reply.
+                                  - if:
+                                      condition:
+                                        lambda: 'return id(media_resampling_speaker)->has_buffered_data();'
+                                      then:
+                                        - speaker.stop:
+                                            id: media_resampling_speaker
                                   - if:
                                       condition:
                                         switch.is_on: wake_sound
@@ -2461,7 +2591,7 @@ select:
     name: "Wake word sensitivity"
     id: wake_word_sensitivity
     optimistic: true
-    initial_option: Slightly sensitive
+    initial_option: ${default_wake_sensitivity}
     restore_value: true
     entity_category: config
     options:
@@ -2469,22 +2599,11 @@ select:
       - Moderately sensitive
       - Very sensitive
     on_value:
-      # Sets specific wake word probabilities computed for each particular model
-      # Note probability cutoffs are set as a quantized uint8 value, each comment has the corresponding floating point cutoff
-      # False Accepts per Hour values are tested against all units and channels from the Dinner Party Corpus.
-      # PERSONAL VARIANT: only the alexa@v2.1 model is built in now, so the
-      # three tiers just adjust its cutoff. Cutoffs are quantized uint8
-      # (round(probability * 255)); LOWER = more sensitive = more false
-      # accepts. Spacing mirrors the proven okay_nabu tiers.
-      lambda: |-
-        if (x == "Slightly sensitive") {
-          id(alexa).set_probability_cutoff(${wake_cutoff_slight});
-        } else if (x == "Moderately sensitive") {
-          id(alexa).set_probability_cutoff(${wake_cutoff_moderate});
-        } else if (x == "Very sensitive") {
-          id(alexa).set_probability_cutoff(${wake_cutoff_very});
-        }
-
+      # Same names and order as the stock firmware: "Slightly" is each model's
+      # own calibrated/manifest cutoff; the other two trade more false accepts
+      # for sensitivity. See apply_wake_sensitivity and the wake_cutoff_*
+      # substitutions.
+      - script.execute: apply_wake_sensitivity
 
 button:
   - platform: factory_reset
