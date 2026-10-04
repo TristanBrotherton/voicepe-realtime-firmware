@@ -2,6 +2,7 @@
 #include "automation.h"
 
 #include "esphome/core/log.h"
+#include "esphome/core/helpers.h"
 #include "esphome/components/audio/audio.h"
 
 #include <algorithm>
@@ -29,6 +30,19 @@ static void va_ws_event_handler(void *handler_args, esp_event_base_t /*base*/, i
 // the quotes + colon, e.g. "\"follow_up_ms\":"). Returns true and sets `out` if a
 // run of digits was found right after the key. Keeps us out of a JSON parser for
 // the few small ints the backend sends in `hello`.
+// Keep identifiers that go into JSON strings to a safe character set (they come
+// from substitutions and backend messages, never from free text).
+static std::string json_safe(const std::string &in) {
+  std::string out;
+  out.reserve(in.size());
+  for (char c : in) {
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+        c == '-' || c == '.' || c == ':')
+      out.push_back(c);
+  }
+  return out;
+}
+
 static bool parse_uint_after_key(const std::string &msg, const char *key, uint32_t &out) {
   size_t p = msg.find(key);
   if (p == std::string::npos)
@@ -80,6 +94,15 @@ void VaClient::setup() {
     ESP_LOGCONFIG(TAG, "Allocated %u ms mic pre-roll buffer in PSRAM (%u samples)",
                   (unsigned) kPreRollMs, (unsigned) this->preroll_capacity_samples_);
   }
+
+  // Pre-wake trigger snapshot buffer (opt-in false-wake review), PSRAM.
+  if (this->preroll_capacity_samples_ > 0) {
+    this->snapshot_buf_ = static_cast<int16_t *>(
+        heap_caps_malloc(this->preroll_capacity_samples_ * sizeof(int16_t),
+                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  }
+  // Turn ids are "<boot id>-<counter>": unique across reboots, no clock needed.
+  this->boot_id_ = random_uint32();
 
   // Tell the resampler what format we'll feed it. The resampler converts to
   // its yaml-configured output format (48k 16-bit) before passing to the
@@ -185,6 +208,11 @@ void VaClient::loop() {
       size_t accepted = this->speaker_->play(this->audio_buf_ + head, contiguous);
       if (accepted > 0) {
         this->last_fed_ms_ = millis();  // keep the chain "warm" for cold-detection
+        // First real reply sample accepted by the speaker chain this turn (after
+        // any cold-start prime and jitter prebuffer): the device's best view of
+        // "first audible" (the I2S/DAC tail adds a further fixed delay).
+        if (this->reply_t_first_audible_ == 0 && this->reply_t_first_audio_ != 0)
+          this->reply_t_first_audible_ = this->last_fed_ms_;
         portENTER_CRITICAL(&this->ring_mux_);
         this->audio_head_ = (this->audio_head_ + accepted) % kAudioBufBytes;
         this->audio_fill_ -= accepted;
@@ -199,6 +227,9 @@ void VaClient::loop() {
       }
     }
   }
+  if (this->snapshot_send_pending_)
+    this->send_trigger_chunks_();
+
   // If a follow-up window was deferred while audio was draining, wait for
   // the downstream chain (resampler + mixer + i2s + DAC tail) to actually
   // finish playing before firing the deferred LED-idle / chime trigger.
@@ -283,6 +314,12 @@ void VaClient::connect_() {
 
   esp_websocket_client_config_t cfg = {};
   cfg.uri = this->url_.c_str();
+  if (!this->token_.empty()) {
+    // The add-on's device_token. Kept in a member: the client reads it
+    // during every (re)connect handshake.
+    this->auth_header_ = "Authorization: Bearer " + this->token_ + "\r\n";
+    cfg.headers = this->auth_header_.c_str();
+  }
   cfg.disable_auto_reconnect = true;  // we drive reconnects ourselves with exponential backoff
   cfg.reconnect_timeout_ms = 5000;    // ignored because disable_auto_reconnect=true
 
@@ -370,6 +407,7 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
       auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
       esp_websocket_client_send_text(handle, start_msg, sizeof(start_msg) - 1, portMAX_DELAY);
       this->set_phase_("idle");
+      this->defer([this]() { this->flush_queued_flags_(); });
       break;
     }
     case WEBSOCKET_EVENT_DATA: {
@@ -427,6 +465,15 @@ void VaClient::handle_text_(const char *data, size_t len) {
 
   if (msg.find("\"type\":\"error\"") != std::string::npos) {
     ESP_LOGW(TAG, "Server reported error: %s", msg.c_str());
+    if (msg.find("\"audible\":true") != std::string::npos) {
+      // A turn the user started failed and the backend could not explain it
+      // out loud: give audible feedback (user-initiated, so never at random).
+      this->defer([this]() {
+        for (auto *t : this->audible_error_triggers_) {
+          t->trigger();
+        }
+      });
+    }
     // Without an audible cue the user just sees the LED go idle and
     // assumes the assistant ignored them. Reuse the on_repeated_failure
     // trigger — it already plays error_cloud_expired and the failure
@@ -471,6 +518,10 @@ void VaClient::handle_text_(const char *data, size_t len) {
         v = kFollowupOpenDelayMaxMs;
       this->wake_open_delay_ms_ = v;
       ESP_LOGI(TAG, "hello: wake mic-open delay = %u ms", (unsigned) v);
+    }
+    if (parse_uint_after_key(msg, "\"trigger_capture\":", v)) {
+      this->backend_trigger_capture_ = (v != 0);
+      ESP_LOGI(TAG, "hello: backend %s trigger capture", v ? "accepts" : "does not accept");
     }
     if (parse_uint_after_key(msg, "\"playback_prebuffer_ms\":", v)) {
       if (v > kPlaybackPrebufferMaxMs)
@@ -527,6 +578,10 @@ void VaClient::handle_text_(const char *data, size_t len) {
   for (const char *p : kPhases) {
     std::string needle = std::string("\"value\":\"") + p + "\"";
     if (msg.find(needle) != std::string::npos) {
+      // A silent (admission-declined) turn ends with "followup":false: close
+      // the session instead of opening a follow-up listening window.
+      if (std::strcmp(p, "idle") == 0 && msg.find("\"followup\":false") != std::string::npos)
+        this->next_idle_no_followup_ = true;
       this->set_phase_(p);
       return;
     }
@@ -546,6 +601,8 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
   if (this->turn_t_first_audio_out_ == 0 && this->turn_t_wake_ != 0) {
     this->turn_t_first_audio_out_ = now_ms;
   }
+  if (this->reply_t_first_audio_ == 0 && this->reply_t_anchor_ != 0)
+    this->reply_t_first_audio_ = now_ms;
   // Detector 1: WS frame inter-arrival jitter. Normal cadence is ~20 ms
   // per frame (OpenAI streams realtime). A gap > kWsGapWarnMs means the
   // bridge stalled, network blip, or OpenAI burst late — anything that
@@ -671,6 +728,18 @@ void VaClient::on_mic_data_(const std::vector<uint8_t> &samples) {
   // "phase":"idle" from the server (response.done).
   if (!this->streaming_) {
     this->preroll_push_(this->mono_buf_.data(), this->mono_buf_.size());
+    if (this->snapshot_requested_ && this->snapshot_buf_ != nullptr && !this->snapshot_ready_) {
+      // Copy the ring (oldest first) at the moment of detection: it holds the
+      // sound that triggered the wake. Mic task is the ring's only writer.
+      const size_t cap = this->preroll_capacity_samples_;
+      const size_t count = this->preroll_count_;
+      const size_t start = (this->preroll_head_ + cap - count) % cap;
+      for (size_t i = 0; i < count; i++)
+        this->snapshot_buf_[i] = this->preroll_buf_[(start + i) % cap];
+      this->snapshot_samples_ = count;
+      this->snapshot_requested_ = false;
+      this->snapshot_ready_ = true;
+    }
     return;
   }
 
@@ -820,6 +889,8 @@ void VaClient::set_phase_(const std::string &phase) {
     if (this->turn_t_listening_ == 0 && this->turn_t_wake_ != 0) {
       this->turn_t_listening_ = millis();
     }
+    if (this->reply_t_listening_ == 0 && this->reply_t_anchor_ != 0)
+      this->reply_t_listening_ = millis();
     // Server heard us — watchdog no longer needed.
     this->cancel_timeout("va_no_speech");
     this->cancel_timeout("va_followup");
@@ -839,6 +910,8 @@ void VaClient::set_phase_(const std::string &phase) {
     if (phase == "thinking" && this->turn_t_thinking_ == 0 && this->turn_t_wake_ != 0) {
       this->turn_t_thinking_ = millis();
     }
+    if (phase == "thinking" && this->reply_t_thinking_ == 0 && this->reply_t_anchor_ != 0)
+      this->reply_t_thinking_ = millis();
     this->cancel_timeout("va_followup");
     this->cancel_timeout("va_followup_open");
     this->cancel_timeout("va_tts_tail");
@@ -886,8 +959,14 @@ void VaClient::set_phase_(const std::string &phase) {
         this->streaming_ = false;
         this->cancel_timeout("va_no_speech");
       }
-    } else if (this->suppress_followup_) {
-      // send_interrupt() set this — user explicitly asked us to stop.
+    } else if (this->suppress_followup_ || this->next_idle_no_followup_) {
+      // send_interrupt() set suppress_followup_ — the user asked us to stop —
+      // or the backend ended a silent turn ("followup":false).
+      if (this->next_idle_no_followup_) {
+        this->next_idle_no_followup_ = false;
+        ESP_LOGI(TAG, "silent turn ended by backend — no follow-up window");
+        this->emit_turn_metrics_("silent");
+      }
       // Close the session cleanly: streaming off, no follow-up, fall through
       // to the regular trigger fire so the LED goes idle.
       this->suppress_followup_ = false;
@@ -1013,7 +1092,17 @@ void VaClient::start_session() {
   // window; replaying it fed the chime back to OpenAI as a phantom "Au!". The
   // mic task does the actual ring reset (its sole owner) when it sees this flag.
   this->preroll_discard_pending_ = true;
-  ESP_LOGI(TAG, "start_session() — streaming on");
+  // New turn: id + timing anchors (metrics for the previous turn, if still
+  // unsent, go out first so every turn reports exactly once).
+  if (this->reply_t_anchor_ != 0 && !this->turn_metrics_sent_)
+    this->emit_turn_metrics_("superseded");
+  this->turn_counter_++;
+  char turn_buf[24];
+  snprintf(turn_buf, sizeof(turn_buf), "%08x-%u", (unsigned) this->boot_id_, (unsigned) this->turn_counter_);
+  this->turn_id_ = turn_buf;
+  this->reply_seq_ = 0;
+  this->turn_metrics_sent_ = false;
+  ESP_LOGI(TAG, "start_session() — streaming on (turn %s)", this->turn_id_.c_str());
   this->streaming_ = true;
   // Tell the backend a fresh wake started (dangling-VAD guard, A). Sent AFTER
   // the residual-reply interrupt above so the backend sees interrupt → wake in
@@ -1040,6 +1129,11 @@ void VaClient::start_session() {
   this->turn_t_listening_ = 0;
   this->turn_t_thinking_ = 0;
   this->turn_t_first_audio_out_ = 0;
+  this->reply_t_anchor_ = this->turn_t_wake_;
+  this->reply_t_listening_ = 0;
+  this->reply_t_thinking_ = 0;
+  this->reply_t_first_audio_ = 0;
+  this->reply_t_first_audible_ = 0;
   // Reset audio-quality detectors for this turn.
   this->last_binary_ms_ = 0;
   this->ws_gap_count_ = 0;
@@ -1051,6 +1145,7 @@ void VaClient::start_session() {
   this->set_timeout("va_no_speech", kNoSpeechTimeoutMs, [this]() {
     ESP_LOGI(TAG, "no speech detected for %u ms — aborting session",
              (unsigned) kNoSpeechTimeoutMs);
+    this->emit_turn_metrics_("no_speech");
     if (this->ws_connected_ && this->ws_handle_ != nullptr) {
       const char m[] = "{\"type\":\"interrupt\"}";
       auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
@@ -1078,38 +1173,11 @@ void VaClient::open_followup_window_(uint32_t duration_ms) {
         t->trigger("idle");
       }
     });
-    // Per-turn latency summary. Anchors are zero if we skipped a milestone
-    // (e.g. interrupt mid-reply); show "?" so the line stays readable.
-    if (this->turn_t_wake_ != 0) {
-      uint32_t now = millis();
-      auto fmt = [](uint32_t from, uint32_t to) -> std::string {
-        if (from == 0 || to == 0 || to < from)
-          return "?";
-        return std::to_string(to - from) + "ms";
-      };
-      ESP_LOGI(TAG,
-               "turn latency: wake→listening=%s listening→thinking=%s "
-               "thinking→first_audio=%s first_audio→played_out=%s "
-               "total=%s",
-               fmt(this->turn_t_wake_, this->turn_t_listening_).c_str(),
-               fmt(this->turn_t_listening_, this->turn_t_thinking_).c_str(),
-               fmt(this->turn_t_thinking_, this->turn_t_first_audio_out_).c_str(),
-               fmt(this->turn_t_first_audio_out_, now).c_str(),
-               fmt(this->turn_t_wake_, now).c_str());
-      // Audio-quality summary: only logged if anything anomalous fired.
-      // A clean turn produces no line — keeps the noise floor low.
-      if (this->ws_gap_count_ > 0 || this->clipped_samples_ > 0 ||
-          this->underrun_logged_this_turn_) {
-        ESP_LOGW(TAG,
-                 "turn audio: ws_gaps=%u (max=%ums) clipped_samples=%u underrun=%s",
-                 (unsigned) this->ws_gap_count_,
-                 (unsigned) this->ws_gap_max_ms_,
-                 (unsigned) this->clipped_samples_,
-                 this->underrun_logged_this_turn_ ? "yes" : "no");
-      }
-      this->turn_t_wake_ = 0;  // mark turn as logged
-    }
   }
+  // Per-turn summary + backend metrics. Used to run only when the idle LED
+  // had been deferred, so short replies that drained before phase=idle never
+  // reported a timeline. Now every reply reports exactly once.
+  this->emit_turn_metrics_("reply");
   if (duration_ms == 0) {
     // Follow-up disabled for this call: turn-based behaviour like the
     // original pipeline. Leave the mic closed; user must say a wake word
@@ -1142,6 +1210,15 @@ void VaClient::open_followup_window_(uint32_t duration_ms) {
     }
     ESP_LOGI(TAG, "follow-up window open (mic on, listening for %u ms)", (unsigned) duration_ms);
     this->streaming_ = true;
+    // A reply in this window is the session's next turn: re-anchor its timing.
+    this->reply_seq_++;
+    this->turn_metrics_sent_ = false;
+    this->reply_t_anchor_ = millis();
+    this->reply_t_listening_ = 0;
+    this->reply_t_thinking_ = 0;
+    this->reply_t_first_audio_ = 0;
+    this->reply_t_first_audible_ = 0;
+    this->fire_ms_ = 0;
     this->fire_phase_led_("listening");  // blue ring: user may answer now
     this->set_timeout("va_followup", duration_ms, [this]() {
       if (this->streaming_) {
@@ -1149,6 +1226,9 @@ void VaClient::open_followup_window_(uint32_t duration_ms) {
         this->streaming_ = false;
         this->send_mic_flush_();        // drop any uncommitted partial utterance
         this->fire_phase_led_("idle");  // no answer came; back to idle
+        // Nobody spoke: there was no turn to time, so report nothing.
+        if (this->reply_t_listening_ == 0)
+          this->reply_t_anchor_ = 0;
       }
     });
   });
@@ -1202,22 +1282,138 @@ void VaClient::enroll_stop(bool notify_backend) {
   this->set_phase_("idle");
 }
 
-void VaClient::send_button_cancel() {
+bool VaClient::send_text_(const std::string &msg, uint32_t timeout_ms) {
   if (!this->ws_connected_ || this->ws_handle_ == nullptr)
-    return;
-  const char m[] = "{\"type\":\"button_cancel\"}";
+    return false;
   auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-  esp_websocket_client_send_text(handle, m, sizeof(m) - 1, 100 / portTICK_PERIOD_MS);
-  ESP_LOGI(TAG, "button cancel sent");
+  return esp_websocket_client_send_text(handle, msg.c_str(), static_cast<int>(msg.size()),
+                                        timeout_ms / portTICK_PERIOD_MS) >= 0;
+}
+
+void VaClient::send_button_cancel() {
+  std::string m = "{\"type\":\"button_cancel\",\"turn\":\"" + json_safe(this->turn_id_) + "\"}";
+  if (this->send_text_(m, 100))
+    ESP_LOGI(TAG, "button cancel sent");
 }
 
 void VaClient::send_false_flag() {
-  if (!this->ws_connected_ || this->ws_handle_ == nullptr)
+  // Names the turn it flags, so the backend labels exactly that wake on this
+  // device. Pressed while offline: queued and sent with its age on reconnect.
+  std::string m = "{\"type\":\"false_flag\",\"turn\":\"" + json_safe(this->turn_id_) + "\"}";
+  if (this->send_text_(m, 100)) {
+    ESP_LOGI(TAG, "explicit false-wake flag sent (double-press, turn %s)", this->turn_id_.c_str());
     return;
-  const char m[] = "{\"type\":\"false_flag\"}";
-  auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-  esp_websocket_client_send_text(handle, m, sizeof(m) - 1, 100 / portTICK_PERIOD_MS);
-  ESP_LOGI(TAG, "explicit false-wake flag sent (double-press)");
+  }
+  if (this->queued_flags_.size() >= kMaxQueuedFlags)
+    this->queued_flags_.erase(this->queued_flags_.begin());
+  this->queued_flags_.emplace_back(this->turn_id_, millis());
+  ESP_LOGW(TAG, "false-wake flag queued (WS down, %u queued)", (unsigned) this->queued_flags_.size());
+}
+
+void VaClient::flush_queued_flags_() {
+  while (!this->queued_flags_.empty() && this->ws_connected_) {
+    const auto &flag = this->queued_flags_.front();
+    std::string m = "{\"type\":\"false_flag\",\"turn\":\"" + json_safe(flag.first) +
+                    "\",\"age_ms\":" + std::to_string(millis() - flag.second) + "}";
+    if (!this->send_text_(m, 200))
+      return;
+    ESP_LOGI(TAG, "queued false-wake flag delivered (turn %s)", flag.first.c_str());
+    this->queued_flags_.erase(this->queued_flags_.begin());
+  }
+}
+
+void VaClient::note_wake_fired(bool from_button) {
+  this->fire_ms_ = millis();
+  this->fire_from_button_ = from_button;
+  // Every wake invalidates an unsent snapshot (e.g. one taken for a wake that
+  // never opened a session), so audio is only ever sent with its own turn.
+  this->snapshot_ready_ = false;
+  this->snapshot_requested_ = false;
+  if (!from_button && this->trigger_capture_enabled_ && this->backend_trigger_capture_ &&
+      this->snapshot_buf_ != nullptr && !this->streaming_) {
+    this->snapshot_requested_ = true;  // consumed by the mic task
+  }
+}
+
+void VaClient::send_shadow_detection(const std::string &model) {
+  std::string m = "{\"type\":\"shadow_detection\",\"model\":\"" + json_safe(model) + "\"}";
+  if (this->send_text_(m, 100))
+    ESP_LOGI(TAG, "shadow model detection reported (%s)", model.c_str());
+}
+
+void VaClient::send_trigger_chunks_() {
+  if (!this->ws_connected_) {
+    this->snapshot_send_pending_ = false;  // never resend stale audio later
+    return;
+  }
+  // Two chunks per loop pass keeps the main loop responsive.
+  for (int i = 0; i < 2 && this->snapshot_send_pending_; i++) {
+    const size_t remaining = this->snapshot_samples_ - this->snapshot_sent_samples_;
+    const size_t n = std::min(remaining, kTriggerChunkSamples);
+    const bool last = (n == remaining);
+    std::string b64 = base64_encode(reinterpret_cast<const uint8_t *>(this->snapshot_buf_ + this->snapshot_sent_samples_),
+                                    n * sizeof(int16_t));
+    std::string m = "{\"type\":\"trigger_audio\",\"turn\":\"" + json_safe(this->snapshot_turn_) +
+                    "\",\"rate\":16000,\"seq\":" + std::to_string(this->snapshot_sent_samples_ / kTriggerChunkSamples) +
+                    (last ? ",\"last\":1" : "") + ",\"b64\":\"" + b64 + "\"}";
+    if (!this->send_text_(m, 200)) {
+      this->snapshot_send_pending_ = false;
+      return;
+    }
+    this->snapshot_sent_samples_ += n;
+    if (last) {
+      this->snapshot_send_pending_ = false;
+      ESP_LOGI(TAG, "trigger snippet sent (%u ms)", (unsigned) (this->snapshot_samples_ / 16));
+    }
+  }
+}
+
+void VaClient::emit_turn_metrics_(const char *reason) {
+  if (this->reply_t_anchor_ == 0 || this->turn_metrics_sent_)
+    return;
+  this->turn_metrics_sent_ = true;
+  const uint32_t now = millis();
+  auto span = [](uint32_t from, uint32_t to) -> int32_t {
+    return (from == 0 || to == 0 || to < from) ? -1 : static_cast<int32_t>(to - from);
+  };
+  const int32_t fire_to_mic = (this->fire_ms_ != 0 && this->reply_seq_ == 0) ? span(this->fire_ms_, this->reply_t_anchor_) : -1;
+  const int32_t wake_to_listening = span(this->reply_t_anchor_, this->reply_t_listening_);
+  const int32_t listening_to_thinking = span(this->reply_t_listening_, this->reply_t_thinking_);
+  const int32_t thinking_to_first_audio = span(this->reply_t_thinking_, this->reply_t_first_audio_);
+  const int32_t first_audio_to_audible = span(this->reply_t_first_audio_, this->reply_t_first_audible_);
+  const int32_t audible_to_drained = span(this->reply_t_first_audible_, now);
+  const int32_t total = span(this->reply_t_anchor_, now);
+  auto fmt = [](int32_t v) -> std::string { return v < 0 ? "?" : std::to_string(v) + "ms"; };
+  ESP_LOGI(TAG,
+           "turn %s seq %u (%s): fire→mic=%s wake→listening=%s listening→thinking=%s "
+           "thinking→first_audio=%s first_audio→audible=%s audible→drained=%s total=%s",
+           this->turn_id_.c_str(), (unsigned) this->reply_seq_, reason, fmt(fire_to_mic).c_str(),
+           fmt(wake_to_listening).c_str(), fmt(listening_to_thinking).c_str(),
+           fmt(thinking_to_first_audio).c_str(), fmt(first_audio_to_audible).c_str(),
+           fmt(audible_to_drained).c_str(), fmt(total).c_str());
+  if (this->ws_gap_count_ > 0 || this->clipped_samples_ > 0 || this->underrun_logged_this_turn_) {
+    ESP_LOGW(TAG, "turn audio: ws_gaps=%u (max=%ums) clipped_samples=%u underrun=%s",
+             (unsigned) this->ws_gap_count_, (unsigned) this->ws_gap_max_ms_,
+             (unsigned) this->clipped_samples_, this->underrun_logged_this_turn_ ? "yes" : "no");
+  }
+  std::string m = "{\"type\":\"turn_metrics\",\"turn\":\"" + json_safe(this->turn_id_) +
+                  "\",\"seq\":" + std::to_string(this->reply_seq_) + ",\"reason\":\"" + reason + "\"";
+  auto add = [&m](const char *key, int32_t v) {
+    if (v >= 0)
+      m += std::string(",\"") + key + "\":" + std::to_string(v);
+  };
+  add("fire_to_mic_ms", fire_to_mic);
+  add("wake_to_listening_ms", wake_to_listening);
+  add("listening_to_thinking_ms", listening_to_thinking);
+  add("thinking_to_first_audio_ms", thinking_to_first_audio);
+  add("first_audio_to_audible_ms", first_audio_to_audible);
+  add("audible_to_drained_ms", audible_to_drained);
+  add("total_ms", total);
+  add("ws_gaps", static_cast<int32_t>(this->ws_gap_count_));
+  add("ws_gap_max_ms", static_cast<int32_t>(this->ws_gap_max_ms_));
+  add("underrun", this->underrun_logged_this_turn_ ? 1 : 0);
+  m += "}";
+  this->send_text_(m, 100);
 }
 
 void VaClient::send_mic_flush_() {
@@ -1245,10 +1441,31 @@ void VaClient::send_wake_() {
   // turn. The backend uses this signal to suppress that stale thinking + cancel
   // the racing response. Sent on every start_session(); old backends ignore it.
   if (this->ws_connected_ && this->ws_handle_ != nullptr) {
-    const char msg[] = "{\"type\":\"wake\"}";
+    // Protocol v2: turn id + the exact wake operating point. Old backends
+    // match only "type":"wake" and ignore the rest.
+    std::string msg = "{\"type\":\"wake\",\"v\":2,\"turn\":\"" + json_safe(this->turn_id_) +
+                      "\",\"src\":\"" + (this->fire_from_button_ ? "button" : "wake_word") + "\"";
+    if (!this->wake_model_.empty()) {
+      msg += ",\"model\":\"" + json_safe(this->wake_model_) + "\"";
+      msg += ",\"model_sha\":\"" + json_safe(this->wake_model_sha_) + "\"";
+      msg += ",\"cutoff_uint8\":" + std::to_string(this->wake_cutoff_);
+      msg += ",\"window\":" + std::to_string(this->wake_window_);
+      msg += ",\"tier\":\"" + json_safe(this->wake_tier_) + "\"";
+    }
+    if (this->fire_ms_ != 0 && millis() - this->fire_ms_ < 30000)
+      msg += ",\"fire_age_ms\":" + std::to_string(millis() - this->fire_ms_);
+    if (!this->firmware_version_.empty())
+      msg += ",\"fw\":\"" + json_safe(this->firmware_version_) + "\"";
+    msg += "}";
     auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-    esp_websocket_client_send_text(handle, msg, sizeof(msg) - 1, portMAX_DELAY);
-    ESP_LOGI(TAG, "wake — sent {\"type\":\"wake\"} (dangling-VAD guard)");
+    esp_websocket_client_send_text(handle, msg.c_str(), static_cast<int>(msg.size()), portMAX_DELAY);
+    ESP_LOGI(TAG, "wake — sent %s", msg.c_str());
+    if (this->snapshot_ready_) {
+      this->snapshot_ready_ = false;
+      this->snapshot_turn_ = this->turn_id_;
+      this->snapshot_sent_samples_ = 0;
+      this->snapshot_send_pending_ = true;
+    }
   }
 }
 
@@ -1283,16 +1500,29 @@ void VaClient::commit_followup_mic() {
   // path; consumed by the mic task on the next frame.)
   this->preroll_discard_pending_ = true;
   this->streaming_ = true;
+  // The answer to the model's question is the session's next timed reply.
+  this->reply_seq_++;
+  this->turn_metrics_sent_ = false;
+  this->reply_t_anchor_ = millis();
+  this->reply_t_listening_ = 0;
+  this->reply_t_thinking_ = 0;
+  this->reply_t_first_audio_ = 0;
+  this->reply_t_first_audible_ = 0;
+  this->fire_ms_ = 0;
   this->set_timeout("va_followup", kRequestFollowUpMs, [this]() {
     if (this->streaming_) {
       ESP_LOGI(TAG, "follow-up window expired — mic streaming off");
       this->streaming_ = false;
       this->send_mic_flush_();  // drop any uncommitted partial utterance
+      if (this->reply_t_listening_ == 0)
+        this->reply_t_anchor_ = 0;
     }
   });
 }
 
 void VaClient::send_interrupt() {
+  if (this->reply_t_anchor_ != 0 && !this->turn_metrics_sent_ && this->reply_t_first_audio_ != 0)
+    this->emit_turn_metrics_("interrupted");
   // Best-effort cancel to the backend — ONLY if the socket is alive. The local
   // cleanup below must ALWAYS run: returning early on a dead socket (the old
   // behaviour) left streaming_ on, the PSRAM ring full and the follow-up timers

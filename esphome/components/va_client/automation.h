@@ -31,5 +31,12 @@ class OnFollowupOpenedTrigger : public Trigger<> {
   }
 };
 
+// Fires when the backend reports a failed turn the user started and asks for
+// audible feedback ({"type":"error","audible":true}); yaml plays a chime.
+class OnAudibleErrorTrigger : public Trigger<> {
+ public:
+  explicit OnAudibleErrorTrigger(VaClient *parent) { parent->add_on_audible_error_trigger(this); }
+};
+
 }  // namespace va_client
 }  // namespace esphome
