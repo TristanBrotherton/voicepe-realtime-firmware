@@ -1,0 +1,73 @@
+{
+  "schema": "voicepe.wakeword.eval/1",
+  "model": {
+    "name": "hey_leonard",
+    "generation": "2026-07-10",
+    "tflite_sha256": "600df3dfd77350a05beab8e5942246dd32c5ffc0d1de5279159061e2f94e24ae",
+    "json_sha256": "b5b6b01a3a8c3b10608eeb215bd799e5439fc4764178a8a43c5c64d5e22a3c75",
+    "cutoff": 0.71,
+    "window": 3
+  },
+  "provenance": {
+    "trainer": "TaterTotterson/microWakeWord-Trainer-AppleSilicon",
+    "trainer_revision": "not recorded by the pipeline",
+    "calibration_generated_at": "2026-07-10T23:05:12.961016+00:00",
+    "selection": "trainer calibration (per-window best)",
+    "pipeline": "manual retrain",
+    "household_data": true,
+    "disclosure": "Real positives come from the maintainer's household (two speakers). Only aggregate metrics are published."
+  },
+  "data_counts": {
+    "synthetic_positive_samples": 50000,
+    "household_positives": 51,
+    "household_speech_negatives": null,
+    "confirmed_false_wake_negatives": 0,
+    "confusable_negatives": null,
+    "confusable_negatives_note": "not recorded per run by the pipeline"
+  },
+  "evaluation": {
+    "positive_dataset": "trainer validation split (synthetic TTS voices with augmentation, plus household repetitions)",
+    "positive_tracks": 50050,
+    "ambient_dataset": "trainer validation_ambient (generic ambient audio, not household recordings)",
+    "ambient_tracks": 4,
+    "ambient_hours": 9.670422,
+    "windows": [
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "cutoff_step": 0.01,
+    "pairs_evaluated": 5,
+    "false_accept_resolution_per_hour": 0.103408,
+    "held_out_household_speakers": false,
+    "notes": "Only the per-window best points were recorded for this generation."
+  },
+  "operating_point": {
+    "cutoff": 0.71,
+    "cutoff_uint8": 181,
+    "window": 3,
+    "recall": 0.966873,
+    "false_accepts_per_hour": 0.827265,
+    "false_accept_events": 8,
+    "ambient_hours": 9.670422
+  },
+  "stratified_recall": {
+    "close": null,
+    "conversational": null,
+    "across_room": null,
+    "status": "not_measured",
+    "reason": "No held-out, distance-labelled positives exist. Household wake repetitions are training data and must not be reused for evaluation. Record them with the evaluation protocol in docs/wake-word-learning.md (voicepe-realtime) to fill these."
+  },
+  "baseline": null,
+  "gate": {
+    "recall_tolerance": 0.01,
+    "faph_tolerance": 0.05,
+    "result": "not_evaluable",
+    "improves_baseline": false,
+    "reasons": [
+      "the previous generation's FA/h was never recorded, so this generation could not be gated"
+    ]
+  }
+}
