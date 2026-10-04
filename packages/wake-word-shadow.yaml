@@ -1,0 +1,35 @@
+# ============================================================================
+# Optional: run a CANDIDATE wake-word model log-only next to the live one.
+#
+# The candidate never starts a session. Each detection is reported to the
+# add-on as metadata ({"type":"shadow_detection"}), counted per device in its
+# weekly report, and compared with the incumbent's wakes by
+# tools/wakeword/promotion.py ("shadow" stage, >= 7 days) before any canary.
+#
+# Add to the device stub, next to the realtime package:
+#
+#   substitutions:
+#     shadow_wake_word_model: "github://<owner>/<repo>/models/candidate.json@<40-hex commit>"
+#     # MUST equal the candidate JSON's "wake_word" value, and must differ
+#     # from the live model's, so the two can be told apart:
+#     shadow_wake_word: "hey leonard candidate"
+#   packages:
+#     shadow:
+#       url: https://github.com/TristanBrotherton/voicepe-realtime-firmware
+#       ref: <same ref as the realtime package>
+#       files: [packages/wake-word-shadow.yaml]
+#       refresh: 0s
+#
+# Cost: one more model in the micro_wake_word engine (~25-30 kB tensor arena).
+# ============================================================================
+micro_wake_word:
+  models:
+    - model: ${shadow_wake_word_model}
+      id: wake_shadow
+      internal: true
+
+esphome:
+  on_boot:
+    - priority: -100
+      then:
+        - micro_wake_word.enable_model: wake_shadow
