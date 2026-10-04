@@ -22,6 +22,9 @@ substitutions:
   wifi_password: !secret wifi_password
   ota_password: !secret ota_password
   api_key: !secret api_key
+  # Optional, recommended: the add-on's device_token (Configuration ->
+  # Privacy & safety). Add va_token to secrets.yaml, then uncomment:
+  # va_token: !secret va_token
   static_ip: !secret static_ip
   gateway: !secret gateway
   subnet: !secret subnet
