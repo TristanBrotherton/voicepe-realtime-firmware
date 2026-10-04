@@ -18,10 +18,15 @@ namespace va_client {
 class OnPhaseTrigger;
 class OnRepeatedFailureTrigger;
 class OnFollowupOpenedTrigger;
+class OnAudibleErrorTrigger;
 
 class VaClient : public Component {
  public:
   void set_url(const std::string &url) { url_ = url; }
+  // Shared secret matching the add-on's device_token; sent as an
+  // "Authorization: Bearer" handshake header when non-empty.
+  void set_token(const std::string &token) { token_ = token; }
+  void set_firmware_version(const std::string &v) { firmware_version_ = v; }
   void set_microphone(microphone::Microphone *m) { mic_ = m; }
   void set_mic_channel(uint8_t c) { mic_channel_ = c; }
   void set_speaker(speaker::Speaker *s) { speaker_ = s; }
@@ -48,6 +53,33 @@ class VaClient : public Component {
   void add_on_followup_opened_trigger(OnFollowupOpenedTrigger *t) {
     followup_opened_triggers_.push_back(t);
   }
+  void add_on_audible_error_trigger(OnAudibleErrorTrigger *t) { audible_error_triggers_.push_back(t); }
+
+  // ---- Wake protocol v2 -----------------------------------------------------
+  // The active wake model's identity and operating point, set from yaml
+  // whenever the wake word or sensitivity changes. Reported in every wake
+  // message so the backend can attribute wakes, false-wake labels and
+  // latency to the exact model/cutoff/window the device ran.
+  void set_wake_info(const std::string &model, const std::string &model_sha, uint8_t cutoff,
+                     uint8_t window, const std::string &tier) {
+    wake_model_ = model;
+    wake_model_sha_ = model_sha;
+    wake_cutoff_ = cutoff;
+    wake_window_ = window;
+    wake_tier_ = tier;
+  }
+  // Called by the yaml wake handler the instant micro_wake_word fires (before
+  // the chime) and by the button handler, so the wake message can report how
+  // long the chime + echo guard took and which source started the turn. When
+  // trigger capture is allowed, also snapshots the pre-roll ring (the audio
+  // that triggered the wake) for false-wake review.
+  void note_wake_fired(bool from_button);
+  // Device-side opt-in for sending the pre-wake snippet; the backend must ALSO
+  // request it in hello ("trigger_capture":1).
+  void set_trigger_capture_enabled(bool enabled) { trigger_capture_enabled_ = enabled; }
+  // Shadow-model detection (optional candidate model running log-only): sent
+  // to the backend as metadata, never starts a session.
+  void send_shadow_detection(const std::string &model);
 
   bool is_connected() const { return ws_connected_; }
 
@@ -94,6 +126,8 @@ class VaClient : public Component {
   // Called from the static esp-idf event handler trampoline.
   void on_ws_event(int32_t event_id, void *event_data);
 
+  const std::string &current_turn_id() const { return this->turn_id_; }
+
  protected:
   void connect_();
   void schedule_reconnect_();
@@ -122,8 +156,21 @@ class VaClient : public Component {
   // independently of a server-sent phase).
   void fire_phase_led_(const std::string &phase);
   void open_followup_window_(uint32_t duration_ms);
+  // Send a JSON text frame if connected (returns false otherwise).
+  bool send_text_(const std::string &msg, uint32_t timeout_ms);
+  // Per-turn timing summary for the backend timeline; always sent once per
+  // reply/turn end (it used to be logged only on the deferred-idle path).
+  void emit_turn_metrics_(const char *reason);
+  // Queued false-wake flags (pressed while the link was down) are sent with
+  // their age once the WebSocket reconnects.
+  void flush_queued_flags_();
+  // Trigger snapshot transfer (mic task copies, main loop sends in chunks).
+  void send_trigger_chunks_();
 
   std::string url_;
+  std::string token_;
+  std::string auth_header_;  // must outlive the esp_websocket_client config
+  std::string firmware_version_;
   uint8_t mic_channel_{0};
 
   microphone::Microphone *mic_{nullptr};
@@ -151,7 +198,39 @@ class VaClient : public Component {
   std::vector<OnPhaseTrigger *> phase_triggers_;
   std::vector<OnRepeatedFailureTrigger *> repeated_failure_triggers_;
   std::vector<OnFollowupOpenedTrigger *> followup_opened_triggers_;
+  std::vector<OnAudibleErrorTrigger *> audible_error_triggers_;
 
+  // ---- Wake protocol v2 state ------------------------------------------------
+  // Turn ids are "<boot id>-<counter>": unique across reboots without a clock.
+  uint32_t boot_id_{0};
+  uint32_t turn_counter_{0};
+  std::string turn_id_;
+  uint32_t reply_seq_{0};       // replies within this session (follow-ups)
+  std::string wake_model_;
+  std::string wake_model_sha_;
+  uint8_t wake_cutoff_{0};
+  uint8_t wake_window_{0};
+  std::string wake_tier_;
+  uint32_t fire_ms_{0};          // micro_wake_word fired (or button pressed)
+  bool fire_from_button_{false};
+  // Queued false-wake flags: (turn id, millis at press). Bounded.
+  static constexpr size_t kMaxQueuedFlags = 4;
+  std::vector<std::pair<std::string, uint32_t>> queued_flags_;
+  // Trigger capture: allowed only when BOTH the device switch and the backend
+  // (hello trigger_capture=1) agree. Snapshot buffer lives in PSRAM.
+  bool trigger_capture_enabled_{false};
+  bool backend_trigger_capture_{false};
+  bool snapshot_requested_{false};   // main loop -> mic task
+  bool snapshot_ready_{false};       // mic task -> main loop
+  int16_t *snapshot_buf_{nullptr};
+  size_t snapshot_samples_{0};
+  size_t snapshot_sent_samples_{0};
+  std::string snapshot_turn_;
+  bool snapshot_send_pending_{false};
+  static constexpr size_t kTriggerChunkSamples = 2048;  // 128 ms per text frame
+  // Set by a backend idle that carries "followup":false (a silent,
+  // admission-declined turn): close the session without a follow-up window.
+  bool next_idle_no_followup_{false};
   // Counts consecutive failed reconnect attempts. Reset to 0 on a clean
   // WS_CONNECTED event. When it hits kRepeatedFailureThreshold we fire the
   // on_repeated_failure trigger exactly once (until the count resets) — yaml
@@ -188,7 +267,9 @@ class VaClient : public Component {
   // preroll_discard_pending_ is set by start_session()/commit_followup_mic()
   // (main loop) and consumed by the mic task: a plain bool like streaming_.
   static constexpr uint32_t kMicSampleRate = 16000;  // i2s_mics rate (16 samples/ms)
-  static constexpr uint32_t kPreRollMs = 600;
+  // 1.5 s: long enough to hold a whole wake phrase when it is snapshotted at
+  // the moment of detection (opt-in trigger capture). Still never replayed.
+  static constexpr uint32_t kPreRollMs = 1500;
   int16_t *preroll_buf_{nullptr};
   size_t preroll_capacity_samples_{0};
   size_t preroll_head_{0};   // next write index
@@ -398,10 +479,20 @@ class VaClient : public Component {
   // transition; flushed as one summary line when the deferred phase=idle
   // emit fires (i.e. when the speaker has actually drained). Zero means
   // "not yet hit this milestone this turn".
-  uint32_t turn_t_wake_{0};               // start_session() (wake-word handler)
+  uint32_t turn_t_wake_{0};               // start_session() (mic opens)
   uint32_t turn_t_listening_{0};          // server's first phase=listening
   uint32_t turn_t_thinking_{0};           // server's phase=thinking (end-of-speech)
   uint32_t turn_t_first_audio_out_{0};    // first binary chunk arrived from server
+  // Per-reply timing for the backend timeline. Separate from the turn_t_*
+  // anchors above (turn_t_first_audio_out_ also drives turn_has_reply_audio()
+  // and must stay set through the follow-up window). Re-anchored when a
+  // follow-up window opens so each reply in a session is timed.
+  uint32_t reply_t_anchor_{0};            // mic opened (wake) or follow-up window opened
+  uint32_t reply_t_listening_{0};
+  uint32_t reply_t_thinking_{0};
+  uint32_t reply_t_first_audio_{0};
+  uint32_t reply_t_first_audible_{0};     // first real reply bytes accepted by the speaker
+  bool turn_metrics_sent_{false};
 
   // Diagnostics for the "speech sometimes drops into hiss / noise"
   // symptom. We don't know the cause yet, so we measure three things
