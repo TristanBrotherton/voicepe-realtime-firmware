@@ -1930,8 +1930,8 @@ script:
             - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
             - script.execute: control_leds
 
-  # (Removed: stock's `activate_stop_word_once` script — orphaned in this fork.
-  # "stop" arming is owned by va_client's on_phase + followup_window_watchdog.)
+# (Removed: stock's `activate_stop_word_once` script — orphaned in this fork.
+# "stop" arming is owned by va_client's on_phase + followup_window_watchdog.)
 
 i2s_audio:
   - id: i2s_output
