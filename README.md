@@ -35,6 +35,8 @@ this realtime firmware from the checkout under review
 (`tools/ci/make_ci_config.py`), runs the wake-word gate and consistency checks
 (`tools/wakeword/`), lints the YAML, and scans for private data.
 
+Release changes are recorded in [`CHANGELOG.md`](CHANGELOG.md).
+
 The [`static/`](static/) web installer restores the **stock** firmware; it does
 not install Voice PE Realtime.
 

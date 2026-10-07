@@ -148,9 +148,13 @@ void VaClient::loop() {
       // real audio waits safely in PSRAM (and builds a small cushion) until priming done.
       {
         const uint32_t now_ms = millis();
-        const bool resampler_cold = this->speaker_->is_stopped() ||
-                                    this->last_fed_ms_ == 0 ||
-                                    (now_ms - this->last_fed_ms_) > kChainColdMs;
+        // Startup-only fallback. A long tool pause can exceed kChainColdMs
+        // without stopping the resampler; re-priming after real reply audio
+        // has started would insert a fabricated 60 ms gap mid-sentence.
+        const bool resampler_cold = !this->reply_audio_started_this_turn_ &&
+                                    (this->speaker_->is_stopped() ||
+                                     this->last_fed_ms_ == 0 ||
+                                     (now_ms - this->last_fed_ms_) > kChainColdMs);
         if (this->chain_prime_remaining_ == 0 && resampler_cold) {
           this->chain_prime_remaining_ =
               (size_t) kChainPrimeMs * (kPlaybackSampleRate / 1000) * 2;  // ms→bytes (mono 16-bit)
@@ -214,12 +218,12 @@ void VaClient::loop() {
       size_t accepted = this->speaker_->play(this->audio_buf_ + head, contiguous);
       if (accepted > 0) {
         this->last_fed_ms_ = millis();  // keep the chain "warm" for cold-detection
-        this->reply_keepalive_next_ms_ = this->last_fed_ms_ + kReplyKeepaliveMs;
         this->reply_audio_started_this_turn_ = true;
+        this->reply_chain_dry_ = false;
         // First real reply sample accepted by the speaker chain this turn (after
         // any cold-start prime and jitter prebuffer): the device's best view of
-        // "first audible" (the I2S/DAC tail adds a further fixed delay). The
-        // keepalive silence below never counts: only real reply audio does.
+        // "first audible" (the I2S/DAC tail adds a further fixed delay). Only
+        // real reply audio reaches this path.
         if (this->reply_t_first_audible_ == 0 && this->reply_t_first_audio_ != 0)
           this->reply_t_first_audible_ = this->last_fed_ms_;
         portENTER_CRITICAL(&this->ring_mux_);
@@ -235,29 +239,24 @@ void VaClient::loop() {
         }
       }
     } else {
-      // Keep the downstream audio path alive across intentional mid-reply
-      // gaps (notably tool calls). The old behavior fed nothing while the
-      // PSRAM ring was empty; a long gap let the resampler/mixer/i2s path run
-      // dry, so the next real burst restarted into an underrun and sounded
-      // distorted. Pace zero PCM at the playback rate only while the server
-      // still says REPLYING. Stop immediately on idle/listening/interrupt.
+      // Do not inject silence here. ESPHome's I2S speaker keeps the DMA stream
+      // clocked and zero-pads at the actual sink. Feeding zero PCM at this
+      // producer boundary can run ahead of wall time and interleave silence
+      // with real speech that is still buffered in the resampler/mixer/I2S
+      // pipeline. Observe a genuinely dry resampler/mixer interval instead so
+      // the backend can correlate it with audible faults without altering PCM.
       const Phase phase_now = static_cast<Phase>(this->current_phase_.load());
-      const uint32_t now_ms = millis();
-      if (phase_now == Phase::REPLYING && !this->suppress_incoming_audio_ &&
-          !this->post_stop_guard_ &&
-          (this->reply_keepalive_next_ms_ == 0 ||
-           static_cast<int32_t>(now_ms - this->reply_keepalive_next_ms_) >= 0)) {
-        static const uint8_t kReplySilence[
-            kReplyKeepaliveMs * (kPlaybackSampleRate / 1000) * 2] = {0};
-        const size_t accepted = this->speaker_->play(kReplySilence, sizeof(kReplySilence));
-        if (accepted > 0) {
-          this->last_fed_ms_ = now_ms;
-          this->reply_keepalive_next_ms_ = now_ms + kReplyKeepaliveMs;
-          this->reply_keepalive_frames_this_turn_++;
-        } else {
-          // Downstream is full; retry soon without spinning every loop tick.
-          this->reply_keepalive_next_ms_ = now_ms + 1;
-        }
+      const bool reply_active = phase_now == Phase::REPLYING &&
+                                this->reply_audio_started_this_turn_ &&
+                                !this->suppress_incoming_audio_ && !this->post_stop_guard_;
+      const bool chain_dry = reply_active && !this->speaker_->has_buffered_data();
+      if (chain_dry && !this->reply_chain_dry_) {
+        this->reply_chain_dry_ = true;
+        this->reply_chain_dry_events_this_turn_++;
+        ESP_LOGW(TAG, "reply chain dry while awaiting more PCM (event %u)",
+                 (unsigned) this->reply_chain_dry_events_this_turn_);
+      } else if (!chain_dry) {
+        this->reply_chain_dry_ = false;
       }
     }
   }
@@ -854,9 +853,8 @@ void VaClient::set_phase_(const std::string &phase) {
   // changed since the last emission.
   const Phase prev = static_cast<Phase>(this->current_phase_.load());
   this->current_phase_.store(static_cast<uint8_t>(phase_from_string_(phase)));
-  if (phase != "replying") {
-    this->reply_keepalive_next_ms_ = 0;
-  }
+  if (phase != "replying")
+    this->reply_chain_dry_ = false;
   ESP_LOGD(TAG, "Phase -> %s", phase.c_str());
 
   // Post-stop `thinking` guard. After a local "stop" the mic gate is closed
@@ -1179,8 +1177,8 @@ void VaClient::start_session() {
   this->clipped_samples_ = 0;
   this->underrun_logged_this_turn_ = false;
   this->reply_audio_started_this_turn_ = false;
-  this->reply_keepalive_next_ms_ = 0;
-  this->reply_keepalive_frames_this_turn_ = 0;
+  this->reply_chain_dry_ = false;
+  this->reply_chain_dry_events_this_turn_ = 0;
   // Watchdog: if server doesn't hear us within kNoSpeechTimeoutMs, abort the
   // session so we're not stuck with the mic open after a misfire.
   this->set_timeout("va_no_speech", kNoSpeechTimeoutMs, [this]() {
@@ -1259,7 +1257,8 @@ void VaClient::open_followup_window_(uint32_t duration_ms) {
     this->reply_t_thinking_ = 0;
     this->reply_t_first_audio_ = 0;
     this->reply_t_first_audible_ = 0;
-    this->reply_keepalive_frames_this_turn_ = 0;
+    this->reply_chain_dry_ = false;
+    this->reply_chain_dry_events_this_turn_ = 0;
     this->fire_ms_ = 0;
     this->fire_phase_led_("listening");  // blue ring: user may answer now
     this->set_timeout("va_followup", duration_ms, [this]() {
@@ -1434,11 +1433,11 @@ void VaClient::emit_turn_metrics_(const char *reason) {
            fmt(thinking_to_first_audio).c_str(), fmt(first_audio_to_audible).c_str(),
            fmt(audible_to_drained).c_str(), fmt(total).c_str());
   if (this->ws_gap_count_ > 0 || this->clipped_samples_ > 0 || this->underrun_logged_this_turn_ ||
-      this->reply_keepalive_frames_this_turn_ > 0) {
-    ESP_LOGW(TAG, "turn audio: ws_gaps=%u (max=%ums) clipped_samples=%u underrun=%s reply_keepalive_frames=%u",
+      this->reply_chain_dry_events_this_turn_ > 0) {
+    ESP_LOGW(TAG, "turn audio: ws_gaps=%u (max=%ums) clipped_samples=%u underrun=%s dry_chain_events=%u",
              (unsigned) this->ws_gap_count_, (unsigned) this->ws_gap_max_ms_,
              (unsigned) this->clipped_samples_, this->underrun_logged_this_turn_ ? "yes" : "no",
-             (unsigned) this->reply_keepalive_frames_this_turn_);
+             (unsigned) this->reply_chain_dry_events_this_turn_);
   }
   std::string m = "{\"type\":\"turn_metrics\",\"turn\":\"" + json_safe(this->turn_id_) +
                   "\",\"seq\":" + std::to_string(this->reply_seq_) + ",\"reason\":\"" + reason + "\"";
@@ -1456,6 +1455,7 @@ void VaClient::emit_turn_metrics_(const char *reason) {
   add("ws_gaps", static_cast<int32_t>(this->ws_gap_count_));
   add("ws_gap_max_ms", static_cast<int32_t>(this->ws_gap_max_ms_));
   add("underrun", this->underrun_logged_this_turn_ ? 1 : 0);
+  add("dry_chain_events", static_cast<int32_t>(this->reply_chain_dry_events_this_turn_));
   m += "}";
   this->send_text_(m, 100);
 }
@@ -1552,7 +1552,8 @@ void VaClient::commit_followup_mic() {
   this->reply_t_thinking_ = 0;
   this->reply_t_first_audio_ = 0;
   this->reply_t_first_audible_ = 0;
-  this->reply_keepalive_frames_this_turn_ = 0;
+  this->reply_chain_dry_ = false;
+  this->reply_chain_dry_events_this_turn_ = 0;
   this->fire_ms_ = 0;
   this->set_timeout("va_followup", kRequestFollowUpMs, [this]() {
     if (this->streaming_) {
