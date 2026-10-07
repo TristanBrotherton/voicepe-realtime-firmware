@@ -391,10 +391,10 @@ class VaClient : public Component {
   // zero state → a startup-transient click. A PSRAM prebuffer can't fix it (the
   // transient is downstream of the ring). Fix: when cold, feed kChainPrimeMs of
   // SILENCE first so the FIR settles to a clean zero output before real audio.
-  // Cold = resampler is_stopped() (precise, true exactly post-speaker.stop) OR,
-  // as a backup, nothing fed for > kChainColdMs. Both are only ever true at a
-  // real cold reply-start, never mid-speech; a needless prime on a warm chain is
-  // harmless (60ms silence).
+  // At reply start, cold = resampler is_stopped() (precise, true exactly
+  // post-speaker.stop) OR, as a backup, nothing fed for > kChainColdMs. The
+  // timer fallback is disabled after the first real PCM is accepted so a long
+  // tool pause cannot fabricate a 60 ms prime in the middle of speech.
   static constexpr uint32_t kChainPrimeMs = 60;   // silence burst to warm the filter
   static constexpr uint32_t kChainColdMs = 600;   // backup timer; is_stopped() is the primary signal
   // Bytes of silence still to feed this cold-start (24kHz mono 16-bit). >0 while
@@ -403,16 +403,14 @@ class VaClient : public Component {
   // millis() of the last time we fed the resampler ANYTHING (silence or real).
   // Used to detect a cold chain: now - last_fed_ms_ > kChainColdMs. 0 = never fed.
   uint32_t last_fed_ms_{0};
-  // Mid-reply silence keepalive. OpenAI may intentionally pause audio while a
-  // tool runs even though phase remains REPLYING. If the downstream chain is
-  // allowed to drain completely, the next PCM burst can arrive to a dry
-  // resampler/mixer/i2s path and produce the observed stutter/rasp. Feed one
-  // real-time-paced 10 ms zero frame while the reply is active and the PSRAM
-  // ring is empty. This keeps the chain warm without fabricating speech or
-  // building an unbounded silence queue.
-  static constexpr uint32_t kReplyKeepaliveMs = 10;
-  uint32_t reply_keepalive_next_ms_{0};
-  uint32_t reply_keepalive_frames_this_turn_{0};
+  // Mid-reply dry-chain telemetry. The I2S speaker owns silence insertion at
+  // the DMA boundary; feeding zero PCM here can splice silence into speech
+  // that is still buffered farther downstream. Instead, observe transitions
+  // where the PSRAM producer ring and the resampler/mixer buffers are both
+  // empty while the server still says REPLYING. The latch counts one event per
+  // dry interval rather than once per loop tick.
+  bool reply_chain_dry_{false};
+  uint32_t reply_chain_dry_events_this_turn_{0};
   // Legacy compile-time default, kept for reference. The live value now comes
   // from the backend (followup_ms_); this stays 0 so a device talking to an
   // old backend that doesn't send follow_up_ms keeps the turn-based behaviour.
