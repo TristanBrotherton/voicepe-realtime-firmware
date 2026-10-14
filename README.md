@@ -6,7 +6,7 @@ low-latency audio client half of
 Wake-word detection (default: **"Hey Leonard"**, switchable to Hey Jarvis /
 Okay Nabu from Home Assistant) runs on-device; everything else — speech
 understanding, replies, smart-home control — streams over a local WebSocket to
-the backend add-on's OpenAI Realtime session.
+the backend add-on's OpenAI Realtime or GPT-Live session.
 
 ## 📖 All documentation lives in the main repo
 
@@ -16,6 +16,18 @@ the backend add-on's OpenAI Realtime session.
 - [Configuration Reference](https://github.com/TristanBrotherton/voicepe-realtime/blob/main/docs/configuration.md) — including this firmware's substitutions (wake word model, sensitivity cutoffs, device name, `va_url`)
 - [Features](https://github.com/TristanBrotherton/voicepe-realtime/blob/main/docs/features.md) — wake words & the retrain flywheel, speaker recognition, timers, and more
 - [FAQ](https://github.com/TristanBrotherton/voicepe-realtime/blob/main/docs/faq.md) — including how to revert to the stock firmware
+- [GPT-Live runtime](https://github.com/TristanBrotherton/voicepe-realtime/blob/main/openai_realtime_voice_agent/DOCS.md#12-gpt-live-runtime-experimental) — the backend's experimental, opt-in `gpt-live-1` runtime (0.19.0) and its [cost safety options](https://github.com/TristanBrotherton/voicepe-realtime/blob/main/docs/configuration.md#-gpt-live-cost-safety)
+
+## Which firmware for which backend
+
+| Firmware (`main`) | Backend add-on | Realtime | GPT-Live (`voice_runtime: live`) |
+|---|---|---|---|
+| 1.3.1 | 0.19.0 and later | yes | yes — no firmware change needed; tested on 1.3.1, whose per-turn playback reports (added after 1.2.0) the backend's Live confirmation gate relies on |
+| 1.3.1 | 0.17.x | yes | n/a (the backend has no Live runtime) |
+| 1.2.0 and older | any | yes | not supported: update the firmware first (one click in ESPHome Builder) |
+
+GPT-Live is a backend option; the device does the same job either way: wake
+word on-device, 16 kHz mic audio up, 24 kHz reply audio down.
 
 ## Building from source
 
