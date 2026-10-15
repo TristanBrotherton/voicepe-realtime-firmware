@@ -38,7 +38,7 @@ substitutions:
   # Pinned to an immutable commit: a model change is a deliberate release
   # (new files, then a new pin), never a silent "@main" drift. CI checks the
   # pin, the sha256 and the window below against models/ and its eval manifest.
-  wake_word_model: "github://TristanBrotherton/voicepe-realtime-firmware/models/hey_leonard.json@e56ee1259c09de6557cea571327b82bbf0928109"
+  wake_word_model: "github://TristanBrotherton/voicepe-realtime-firmware/models/hey_leonard.json@58180f6e5c5c478cd26f5db3f57a4244515557ec"
   default_wake_word: "Hey Leonard"
   # Identity of the packaged model, reported to Home Assistant and the add-on.
   wake_model_name: "hey_leonard"
