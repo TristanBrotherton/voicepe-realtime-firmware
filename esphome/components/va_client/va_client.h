@@ -11,6 +11,8 @@
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/portmacro.h>
+#include <freertos/ringbuf.h>
+#include <freertos/task.h>
 
 namespace esphome {
 namespace va_client {
@@ -253,6 +255,22 @@ class VaClient : public Component {
   // dropped garbage samples into the playback ring (audible as hiss).
   std::vector<int16_t> mono_buf_;
   std::vector<int16_t> tts_buf_;
+
+  // Mic -> WebSocket hand-off. The mic callback used to send each 20 ms frame
+  // itself with a 10 ms timeout; the ESP-IDF client treats a socket write that
+  // times out (returns 0) as a network error and aborts the connection, so a
+  // TCP stall of a few tens of ms dropped the whole session (Workshop,
+  // 2026-10-16: "transport_poll_write(0)", then "WS disconnected"). The mic
+  // callback now only queues frames here (never waits on the network) and a
+  // sender task writes them with a timeout long enough to ride out a stall.
+  static constexpr size_t kMicTxBytes = 32000;           // 1 s of 16 kHz int16 mono
+  static constexpr size_t kMicTxMaxChunk = 3200;         // send at most 100 ms per write
+  static constexpr uint32_t kMicTxSendTimeoutMs = 1000;  // a stall this long is a dead link
+  RingbufHandle_t mic_tx_rb_{nullptr};
+  TaskHandle_t mic_tx_task_{nullptr};
+  std::atomic<uint32_t> mic_tx_dropped_{0};
+  static void mic_tx_task_fn_(void *arg);
+  void mic_tx_loop_();
 
   // Mic pre-roll ring (int16 mono @ kMicSampleRate), allocated in PSRAM. The
   // rolling ring continuously retains the most recent kPreRollMs of mic audio
