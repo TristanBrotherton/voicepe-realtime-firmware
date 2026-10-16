@@ -64,6 +64,15 @@ static bool parse_uint_after_key(const std::string &msg, const char *key, uint32
 void VaClient::setup() {
   ESP_LOGCONFIG(TAG, "Setting up VA Client...");
 
+  // Mic -> WebSocket hand-off (see kMicTxBytes): a PSRAM byte ring and its
+  // sender task.
+  this->mic_tx_rb_ = xRingbufferCreateWithCaps(kMicTxBytes, RINGBUF_TYPE_BYTEBUF,
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (this->mic_tx_rb_ == nullptr ||
+      xTaskCreate(&VaClient::mic_tx_task_fn_, "va_mic_tx", 4096, this, 5, &this->mic_tx_task_) != pdPASS) {
+    ESP_LOGE(TAG, "Failed to start the mic sender; mic frames will be sent from the mic task");
+  }
+
   if (this->mic_ != nullptr) {
     this->mic_->add_data_callback(
         [this](const std::vector<uint8_t> &data) { this->on_mic_data_(data); });
@@ -793,12 +802,49 @@ void VaClient::on_mic_data_(const std::vector<uint8_t> &samples) {
     this->preroll_head_ = 0;
   }
 
-  // 10ms timeout (~portTICK_PERIOD_MS): if WS task is briefly busy we wait
-  // a tick rather than dropping the frame and spamming "Could not lock"
-  // errors. If we're swamped, we accept dropping rather than blocking mic.
+  const size_t bytes = this->mono_buf_.size() * sizeof(int16_t);
+  if (this->mic_tx_task_ != nullptr) {
+    // Queue only: the mic task (shared with wake word detection) never waits
+    // on the network. A full ring (over 1 s behind) drops this frame.
+    if (xRingbufferSend(this->mic_tx_rb_, this->mono_buf_.data(), bytes, 0) != pdTRUE)
+      this->mic_tx_dropped_.fetch_add(1);
+    return;
+  }
+  // Fallback without the sender task: the old direct send.
   esp_websocket_client_send_bin(handle, reinterpret_cast<const char *>(this->mono_buf_.data()),
-                                static_cast<int>(this->mono_buf_.size() * sizeof(int16_t)),
-                                10 / portTICK_PERIOD_MS);
+                                static_cast<int>(bytes), 10 / portTICK_PERIOD_MS);
+}
+
+void VaClient::mic_tx_task_fn_(void *arg) { static_cast<VaClient *>(arg)->mic_tx_loop_(); }
+
+void VaClient::mic_tx_loop_() {
+  uint32_t last_warn_ms = 0;
+  for (;;) {
+    size_t len = 0;
+    void *item = xRingbufferReceiveUpTo(this->mic_tx_rb_, &len, pdMS_TO_TICKS(200), kMicTxMaxChunk);
+    const uint32_t dropped = this->mic_tx_dropped_.exchange(0);
+    if (dropped != 0 && millis() - last_warn_ms > 1000) {
+      ESP_LOGW(TAG, "mic sender over 1 s behind: dropped %u mic frames", (unsigned) dropped);
+      last_warn_ms = millis();
+    }
+    if (item == nullptr)
+      continue;
+    auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
+    if (this->ws_connected_ && handle != nullptr) {
+      const uint32_t t0 = millis();
+      const int sent = esp_websocket_client_send_bin(handle, static_cast<const char *>(item),
+                                                     static_cast<int>(len),
+                                                     pdMS_TO_TICKS(kMicTxSendTimeoutMs));
+      const uint32_t took = millis() - t0;
+      if (sent < 0) {
+        ESP_LOGW(TAG, "mic send failed after %u ms (%u bytes)", (unsigned) took, (unsigned) len);
+      } else if (took > 50) {
+        ESP_LOGD(TAG, "mic send stalled %u ms (rode it out)", (unsigned) took);
+      }
+    }
+    // Not connected: the frame is discarded (a reconnect starts a new turn).
+    vRingbufferReturnItem(this->mic_tx_rb_, item);
+  }
 }
 
 void VaClient::preroll_push_(const int16_t *data, size_t n) {
