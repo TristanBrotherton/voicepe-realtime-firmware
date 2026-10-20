@@ -228,6 +228,11 @@ class VaClient : public Component {
   size_t snapshot_samples_{0};
   size_t snapshot_sent_samples_{0};
   std::string snapshot_turn_;
+  // Turn the pending snapshot belongs to, set when the wake is announced. The
+  // mic task copies the ring a frame AFTER the wake message goes out, so the
+  // snapshot is sent from loop() once it is ready and the session has closed
+  // (never competing with live mic audio).
+  std::string snapshot_wake_turn_;
   bool snapshot_send_pending_{false};
   static constexpr size_t kTriggerChunkSamples = 2048;  // 128 ms per text frame
   // Set by a backend idle that carries "followup":false (a silent,
@@ -285,9 +290,10 @@ class VaClient : public Component {
   // preroll_discard_pending_ is set by start_session()/commit_followup_mic()
   // (main loop) and consumed by the mic task: a plain bool like streaming_.
   static constexpr uint32_t kMicSampleRate = 16000;  // i2s_mics rate (16 samples/ms)
-  // 1.5 s: long enough to hold a whole wake phrase when it is snapshotted at
-  // the moment of detection (opt-in trigger capture). Still never replayed.
-  static constexpr uint32_t kPreRollMs = 1500;
+  // 5 s: holds the wake phrase that fired AND, when the user had to repeat
+  // it, the earlier attempt the model missed (opt-in trigger capture: those
+  // misses are the training data a retrain needs most). Never replayed.
+  static constexpr uint32_t kPreRollMs = 5000;
   int16_t *preroll_buf_{nullptr};
   size_t preroll_capacity_samples_{0};
   size_t preroll_head_{0};   // next write index

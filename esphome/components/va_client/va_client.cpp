@@ -269,6 +269,14 @@ void VaClient::loop() {
       }
     }
   }
+  if (this->snapshot_ready_ && !this->snapshot_wake_turn_.empty() && !this->streaming_ &&
+      !this->snapshot_send_pending_) {
+    this->snapshot_ready_ = false;
+    this->snapshot_turn_ = this->snapshot_wake_turn_;
+    this->snapshot_wake_turn_.clear();
+    this->snapshot_sent_samples_ = 0;
+    this->snapshot_send_pending_ = true;
+  }
   if (this->snapshot_send_pending_)
     this->send_trigger_chunks_();
 
@@ -769,20 +777,22 @@ void VaClient::on_mic_data_(const std::vector<uint8_t> &samples) {
   // rolling buffer kept around for a possible future capture-gating approach.
   // The session opens via start_session() (wake handler) and closes on
   // "phase":"idle" from the server (response.done).
+  // Copy the ring (oldest first) at the moment of detection: it holds the
+  // sound that triggered the wake. Done before the streaming gate because the
+  // session may already be open by the next mic frame; the ring is only
+  // discarded further down. Mic task is the ring's only writer.
+  if (this->snapshot_requested_ && this->snapshot_buf_ != nullptr && !this->snapshot_ready_) {
+    const size_t cap = this->preroll_capacity_samples_;
+    const size_t count = this->preroll_count_;
+    const size_t start = (this->preroll_head_ + cap - count) % cap;
+    for (size_t i = 0; i < count; i++)
+      this->snapshot_buf_[i] = this->preroll_buf_[(start + i) % cap];
+    this->snapshot_samples_ = count;
+    this->snapshot_requested_ = false;
+    this->snapshot_ready_ = true;
+  }
   if (!this->streaming_) {
     this->preroll_push_(this->mono_buf_.data(), this->mono_buf_.size());
-    if (this->snapshot_requested_ && this->snapshot_buf_ != nullptr && !this->snapshot_ready_) {
-      // Copy the ring (oldest first) at the moment of detection: it holds the
-      // sound that triggered the wake. Mic task is the ring's only writer.
-      const size_t cap = this->preroll_capacity_samples_;
-      const size_t count = this->preroll_count_;
-      const size_t start = (this->preroll_head_ + cap - count) % cap;
-      for (size_t i = 0; i < count; i++)
-        this->snapshot_buf_[i] = this->preroll_buf_[(start + i) % cap];
-      this->snapshot_samples_ = count;
-      this->snapshot_requested_ = false;
-      this->snapshot_ready_ = true;
-    }
     return;
   }
 
@@ -1416,6 +1426,8 @@ void VaClient::note_wake_fired(bool from_button) {
   // never opened a session), so audio is only ever sent with its own turn.
   this->snapshot_ready_ = false;
   this->snapshot_requested_ = false;
+  this->snapshot_wake_turn_.clear();
+  this->snapshot_send_pending_ = false;  // a half-sent older snapshot is dropped
   if (!from_button && this->trigger_capture_enabled_ && this->backend_trigger_capture_ &&
       this->snapshot_buf_ != nullptr && !this->streaming_) {
     this->snapshot_requested_ = true;  // consumed by the mic task
@@ -1550,12 +1562,8 @@ void VaClient::send_wake_() {
     auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
     esp_websocket_client_send_text(handle, msg.c_str(), static_cast<int>(msg.size()), portMAX_DELAY);
     ESP_LOGI(TAG, "wake — sent %s", msg.c_str());
-    if (this->snapshot_ready_) {
-      this->snapshot_ready_ = false;
-      this->snapshot_turn_ = this->turn_id_;
-      this->snapshot_sent_samples_ = 0;
-      this->snapshot_send_pending_ = true;
-    }
+    if (this->snapshot_requested_ || this->snapshot_ready_)
+      this->snapshot_wake_turn_ = this->turn_id_;  // sent by loop() when ready
   }
 }
 
