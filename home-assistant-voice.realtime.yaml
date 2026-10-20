@@ -368,9 +368,10 @@ globals:
     initial_value: 'false'
 
 switch:
-  # Opt-in: send the ~1.5 s BEFORE a wake (the sound that triggered it) to the
-  # add-on for false-wake review. Also requires the add-on's trigger_capture
-  # option; audio stays on the Home Assistant host. Off by default.
+  # Opt-in: send the 5 s BEFORE a wake (the sound that triggered it, and any
+  # missed earlier attempt) to the add-on for wake-word training. Sent after
+  # the turn ends. Also requires the add-on's trigger_capture option; audio
+  # stays on the Home Assistant host. Off by default.
   - platform: template
     id: share_trigger_audio
     name: "Share wake trigger audio"
