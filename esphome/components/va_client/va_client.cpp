@@ -278,6 +278,7 @@ void VaClient::loop() {
     this->snapshot_wake_turn_.clear();
     this->snapshot_sent_samples_ = 0;
     this->snapshot_send_pending_ = true;
+    ESP_LOGD(TAG, "trigger snippet queued (%u samples)", (unsigned) this->snapshot_samples_);
   }
   if (this->snapshot_send_pending_)
     this->send_trigger_chunks_();
@@ -1450,6 +1451,8 @@ void VaClient::send_trigger_chunks_() {
   char *buf = this->trigger_msg_buf_;
   const std::string turn = json_safe(this->snapshot_turn_);
   if (buf == nullptr || this->ws_handle_ == nullptr || turn.size() > 128) {
+    ESP_LOGW(TAG, "trigger snippet skipped (buffer %s, turn id %u chars)", buf ? "ok" : "missing",
+             (unsigned) turn.size());
     this->snapshot_send_pending_ = false;  // skip the clip; never crash for it
     return;
   }
@@ -1467,6 +1470,7 @@ void VaClient::send_trigger_chunks_() {
         mbedtls_base64_encode(reinterpret_cast<unsigned char *>(buf + head), kTriggerMsgBytes - head - 3, &b64_len,
                               reinterpret_cast<const unsigned char *>(this->snapshot_buf_ + this->snapshot_sent_samples_),
                               n * sizeof(int16_t)) != 0) {
+      ESP_LOGW(TAG, "trigger snippet skipped (frame did not fit)");
       this->snapshot_send_pending_ = false;
       return;
     }
@@ -1475,6 +1479,7 @@ void VaClient::send_trigger_chunks_() {
     buf[len++] = '}';
     if (!this->ws_connected_ ||
         esp_websocket_client_send_text(handle, buf, static_cast<int>(len), 200 / portTICK_PERIOD_MS) < 0) {
+      ESP_LOGW(TAG, "trigger snippet not sent (chunk %u)", (unsigned) (this->snapshot_sent_samples_ / kTriggerChunkSamples));
       this->snapshot_send_pending_ = false;
       return;
     }
