@@ -11,6 +11,7 @@
 #include <esp_websocket_client.h>
 #include <esp_event.h>
 #include <esp_heap_caps.h>
+#include <mbedtls/base64.h>
 
 namespace esphome {
 namespace va_client {
@@ -109,6 +110,7 @@ void VaClient::setup() {
     this->snapshot_buf_ = static_cast<int16_t *>(
         heap_caps_malloc(this->preroll_capacity_samples_ * sizeof(int16_t),
                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    this->trigger_msg_buf_ = static_cast<char *>(heap_caps_malloc(kTriggerMsgBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   }
   // Turn ids are "<boot id>-<counter>": unique across reboots, no clock needed.
   this->boot_id_ = random_uint32();
@@ -276,6 +278,7 @@ void VaClient::loop() {
     this->snapshot_wake_turn_.clear();
     this->snapshot_sent_samples_ = 0;
     this->snapshot_send_pending_ = true;
+    ESP_LOGD(TAG, "trigger snippet queued (%u samples)", (unsigned) this->snapshot_samples_);
   }
   if (this->snapshot_send_pending_)
     this->send_trigger_chunks_();
@@ -1445,17 +1448,38 @@ void VaClient::send_trigger_chunks_() {
     this->snapshot_send_pending_ = false;  // never resend stale audio later
     return;
   }
+  char *buf = this->trigger_msg_buf_;
+  const std::string turn = json_safe(this->snapshot_turn_);
+  if (buf == nullptr || this->ws_handle_ == nullptr || turn.size() > 128) {
+    ESP_LOGW(TAG, "trigger snippet skipped (buffer %s, turn id %u chars)", buf ? "ok" : "missing",
+             (unsigned) turn.size());
+    this->snapshot_send_pending_ = false;  // skip the clip; never crash for it
+    return;
+  }
+  auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
   // Two chunks per loop pass keeps the main loop responsive.
   for (int i = 0; i < 2 && this->snapshot_send_pending_; i++) {
     const size_t remaining = this->snapshot_samples_ - this->snapshot_sent_samples_;
     const size_t n = std::min(remaining, kTriggerChunkSamples);
     const bool last = (n == remaining);
-    std::string b64 = base64_encode(reinterpret_cast<const uint8_t *>(this->snapshot_buf_ + this->snapshot_sent_samples_),
-                                    n * sizeof(int16_t));
-    std::string m = "{\"type\":\"trigger_audio\",\"turn\":\"" + json_safe(this->snapshot_turn_) +
-                    "\",\"rate\":16000,\"seq\":" + std::to_string(this->snapshot_sent_samples_ / kTriggerChunkSamples) +
-                    (last ? ",\"last\":1" : "") + ",\"b64\":\"" + b64 + "\"}";
-    if (!this->send_text_(m, 200)) {
+    int head = snprintf(buf, kTriggerMsgBytes, "{\"type\":\"trigger_audio\",\"turn\":\"%s\",\"rate\":16000,\"seq\":%u%s,\"b64\":\"",
+                        turn.c_str(), (unsigned) (this->snapshot_sent_samples_ / kTriggerChunkSamples),
+                        last ? ",\"last\":1" : "");
+    size_t b64_len = 0;
+    if (head <= 0 || (size_t) head >= kTriggerMsgBytes ||
+        mbedtls_base64_encode(reinterpret_cast<unsigned char *>(buf + head), kTriggerMsgBytes - head - 3, &b64_len,
+                              reinterpret_cast<const unsigned char *>(this->snapshot_buf_ + this->snapshot_sent_samples_),
+                              n * sizeof(int16_t)) != 0) {
+      ESP_LOGW(TAG, "trigger snippet skipped (frame did not fit)");
+      this->snapshot_send_pending_ = false;
+      return;
+    }
+    size_t len = head + b64_len;
+    buf[len++] = '"';
+    buf[len++] = '}';
+    if (!this->ws_connected_ ||
+        esp_websocket_client_send_text(handle, buf, static_cast<int>(len), 200 / portTICK_PERIOD_MS) < 0) {
+      ESP_LOGW(TAG, "trigger snippet not sent (chunk %u)", (unsigned) (this->snapshot_sent_samples_ / kTriggerChunkSamples));
       this->snapshot_send_pending_ = false;
       return;
     }
