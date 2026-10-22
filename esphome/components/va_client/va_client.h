@@ -235,6 +235,11 @@ class VaClient : public Component {
   std::string snapshot_wake_turn_;
   bool snapshot_send_pending_{false};
   static constexpr size_t kTriggerChunkSamples = 2048;  // 128 ms per text frame
+  // One trigger_audio frame (JSON header + base64 chunk), built in place in a
+  // PSRAM buffer allocated once: building it from std::string temporaries on
+  // the internal heap aborted the device when an allocation failed after a reply.
+  static constexpr size_t kTriggerMsgBytes = 256 + 4 * ((kTriggerChunkSamples * sizeof(int16_t) + 2) / 3) + 1;
+  char *trigger_msg_buf_{nullptr};
   // Set by a backend idle that carries "followup":false (a silent,
   // admission-declined turn): close the session without a follow-up window.
   bool next_idle_no_followup_{false};
