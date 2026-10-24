@@ -534,6 +534,9 @@ class VaClient : public Component {
   uint32_t reply_t_first_audio_{0};
   uint32_t reply_t_first_audible_{0};     // first real reply bytes accepted by the speaker
   bool turn_metrics_sent_{false};
+  // Exact identity from the ordered output_batch_end marker. It is echoed only
+  // by the matching successful reply drain and cleared at every turn boundary.
+  std::string output_batch_id_;
 
   // Diagnostics for the "speech sometimes drops into hiss / noise"
   // symptom. We don't know the cause yet, so we measure three things
