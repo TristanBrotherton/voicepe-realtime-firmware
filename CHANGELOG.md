@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- `va_client` handles the add-on's `output_batch_end` marker: it keeps the
+  marker's `output_batch_id` and echoes it in the `turn_metrics` report of the
+  reply that drained, so the add-on can confirm which output batch the device
+  actually played. The id is cleared at every turn boundary and after each
+  report, and only a `reason: "reply"` report carries it. A malformed marker is
+  logged and ignored. Without this, add-ons that fence their output wait for a
+  drain confirmation that never arrives.
+
 ## 1.3.1 — 2026-10-06
 
 - Removed the application-level silence keepalive that could enqueue zero PCM

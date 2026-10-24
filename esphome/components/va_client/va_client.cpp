@@ -62,6 +62,18 @@ static bool parse_uint_after_key(const std::string &msg, const char *key, uint32
   return true;
 }
 
+static bool parse_string_after_key(const std::string &msg, const char *key, std::string &out) {
+  size_t p = msg.find(key);
+  if (p == std::string::npos)
+    return false;
+  p += std::strlen(key);
+  const size_t end = msg.find('"', p);
+  if (end == std::string::npos || end == p)
+    return false;
+  out = json_safe(msg.substr(p, end - p));
+  return !out.empty();
+}
+
 void VaClient::setup() {
   ESP_LOGCONFIG(TAG, "Setting up VA Client...");
 
@@ -583,6 +595,21 @@ void VaClient::handle_text_(const char *data, size_t len) {
       ESP_LOGI(TAG, "hello: playback prebuffer (jitter buffer) = %u ms (%s)", (unsigned) v,
                v == 0 ? "disabled" : "cushion before playback");
     }
+    return;
+  }
+
+  if (msg.find("\"type\":\"output_batch_end\"") != std::string::npos) {
+    std::string batch_id;
+    uint32_t pcm_bytes = 0;
+    if (!parse_string_after_key(msg, "\"output_batch_id\":\"", batch_id) ||
+        !parse_uint_after_key(msg, "\"pcm_bytes\":", pcm_bytes)) {
+      ESP_LOGW(TAG, "invalid output_batch_end marker ignored");
+      this->output_batch_id_.clear();
+      return;
+    }
+    this->output_batch_id_ = batch_id;
+    ESP_LOGI(TAG, "output batch %s fenced after %u PCM bytes", batch_id.c_str(),
+             (unsigned) pcm_bytes);
     return;
   }
 
@@ -1197,6 +1224,7 @@ void VaClient::start_session() {
   this->turn_id_ = turn_buf;
   this->reply_seq_ = 0;
   this->turn_metrics_sent_ = false;
+  this->output_batch_id_.clear();
   ESP_LOGI(TAG, "start_session() — streaming on (turn %s)", this->turn_id_.c_str());
   this->streaming_ = true;
   // Tell the backend a fresh wake started (dangling-VAD guard, A). Sent AFTER
@@ -1311,6 +1339,7 @@ void VaClient::open_followup_window_(uint32_t duration_ms) {
     // A reply in this window is the session's next turn: re-anchor its timing.
     this->reply_seq_++;
     this->turn_metrics_sent_ = false;
+    this->output_batch_id_.clear();
     this->reply_t_anchor_ = millis();
     this->reply_t_listening_ = 0;
     this->reply_t_thinking_ = 0;
@@ -1538,8 +1567,11 @@ void VaClient::emit_turn_metrics_(const char *reason) {
   add("ws_gap_max_ms", static_cast<int32_t>(this->ws_gap_max_ms_));
   add("underrun", this->underrun_logged_this_turn_ ? 1 : 0);
   add("dry_chain_events", static_cast<int32_t>(this->reply_chain_dry_events_this_turn_));
+  if (std::strcmp(reason, "reply") == 0 && !this->output_batch_id_.empty())
+    m += ",\"output_batch_id\":\"" + json_safe(this->output_batch_id_) + "\"";
   m += "}";
   this->send_text_(m, 100);
+  this->output_batch_id_.clear();
 }
 
 void VaClient::send_mic_flush_() {
@@ -1625,6 +1657,7 @@ void VaClient::commit_followup_mic() {
   // The answer to the model's question is the session's next timed reply.
   this->reply_seq_++;
   this->turn_metrics_sent_ = false;
+  this->output_batch_id_.clear();
   this->reply_t_anchor_ = millis();
   this->reply_t_listening_ = 0;
   this->reply_t_thinking_ = 0;
