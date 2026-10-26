@@ -9,6 +9,9 @@ on:
   release:
     types: [published]
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -30,6 +33,10 @@ jobs:
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.owner.login == 'esphome'
     name: Comment on PR
     runs-on: ubuntu-latest
+    # Only runs for pull requests from the upstream esphome organisation, so
+    # never in this repository; it keeps the read-only token it had before.
+    permissions:
+      actions: read  # list this run's artifacts
     needs:
       - build-firmware
     steps:
@@ -65,7 +72,10 @@ jobs:
     uses: esphome/workflows/.github/workflows/upload-to-r2.yml@025a1e6255610c498ed590403b7e510b69e474df  # 2026.4.1
     with:
       directory: ${{ github.event.repository.name }}
-    secrets: inherit
+    # Release events only (never pull requests). The called workflow is
+    # SHA-pinned and does not declare its secrets, so they cannot be passed
+    # one by one.
+    secrets: inherit  # zizmor: ignore[secrets-inherit]
 
   summary:
     if: github.event_name == 'release'
@@ -75,14 +85,19 @@ jobs:
       - upload-to-r2
     steps:
       - name: Generate
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
         run: |-
-          echo "## Firmware built successfully!" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "[Install here](https://esphome.github.io/${{ github.event.repository.name }}/?version=${{ github.event.release.tag_name }}) and test **before** approving deployment to beta or production." >> $GITHUB_STEP_SUMMARY
+          echo "## Firmware built successfully!" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "[Install here](https://esphome.github.io/${REPO_NAME}/?version=${TAG_NAME}) and test **before** approving deployment to beta or production." >> "$GITHUB_STEP_SUMMARY"
 
   upload-to-release:
     name: Upload to Release
     if: github.event_name == 'release'
+    permissions:
+      contents: write  # attach the firmware to the GitHub release
     uses: esphome/workflows/.github/workflows/upload-to-gh-release.yml@025a1e6255610c498ed590403b7e510b69e474df  # 2026.4.1
     needs:
       - build-firmware
@@ -100,7 +115,7 @@ jobs:
       directory: ${{ github.event.repository.name }}
       channel: beta
       manifest-filename: manifest-beta.json
-    secrets: inherit
+    secrets: inherit  # zizmor: ignore[secrets-inherit] release only; see upload-to-r2
 
   promote-prod:
     name: Promote to Production
@@ -113,4 +128,4 @@ jobs:
       directory: ${{ github.event.repository.name }}
       channel: production
       manifest-filename: manifest.json
-    secrets: inherit
+    secrets: inherit  # zizmor: ignore[secrets-inherit] release only; see upload-to-r2

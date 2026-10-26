@@ -4,6 +4,8 @@ on:
   release:
     types: [edited]
 
+permissions: {}
+
 jobs:
   update-latest:
     name: Update latest build version
@@ -17,11 +19,16 @@ jobs:
           - ha-voice-8mb
     steps:
       - name: Download version manifest from R2
-        run: curl -o manifest.json https://firmware.esphome.io/home-assistant-voice-pe/${{ matrix.device }}/${{ github.event.release.tag_name }}/manifest.json
+        env:
+          DEVICE: ${{ matrix.device }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: curl -o manifest.json "https://firmware.esphome.io/home-assistant-voice-pe/${DEVICE}/${TAG_NAME}/manifest.json"
       - name: Update paths
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
         run: |
           mkdir output
-          version="${{ github.event.release.tag_name }}"
+          version="${TAG_NAME}"
           jq --arg version "$version" \
               '.builds[].ota.path |= $version + "/" + . | (.builds[].parts // [])[].path |= $version + "/" + .' \
               manifest.json > output/manifest.json
