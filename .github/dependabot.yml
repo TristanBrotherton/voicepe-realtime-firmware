@@ -6,7 +6,17 @@ updates:
     schedule:
       interval: daily
       time: "06:00"
+    cooldown:
+      default-days: 7
     groups:
       shared-workflows:
         patterns:
           - "esphome/workflows*"
+
+  # Hash-locked CI tools (zizmor).
+  - package-ecosystem: "pip"
+    directory: "/.github/ci"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
