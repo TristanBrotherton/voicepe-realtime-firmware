@@ -1483,8 +1483,8 @@ script:
             id(control_leds_voice_assistant_idle_phase).execute();
           }
 
-  # va-direct: brief SOLID red flash confirming a "stop" was registered (the
-  # response/turn was cancelled). Called from the stop branch of
+  # va-direct: brief SOLID red flash confirming a "stop" cut off a reply that
+  # was playing (a stop in the follow-up window after it closes quietly). Called from the stop branch of
   # on_wake_word_detected — only when a stop ACTUALLY fires (the E-fix may ignore
   # a stop before any reply audio; that path doesn't flash, nothing was stopped).
   # The phase is already set to idle before this runs, so the closing
@@ -2441,14 +2441,36 @@ micro_wake_word:
                           condition:
                             lambda: 'return id(voice_assistant_phase) != ${voice_assist_idle_phase_id} && id(va)->turn_has_reply_audio();'
                           then:
-                            - lambda: 'id(va)->send_interrupt();'
-                            - speaker.stop:
-                                id: media_resampling_speaker
-                            - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
-                            # Red stop-confirmation flash, then the idle ring
-                            # (phase is idle, so stop_feedback_flash's closing
-                            # control_leds shows idle).
-                            - script.execute: stop_feedback_flash
+                            # Red only when a reply was actually cut off. A stop
+                            # in the follow-up window after the reply has finished
+                            # (often a misfire on "thanks") ends the turn quietly:
+                            # the ring just goes back to idle.
+                            - if:
+                                condition:
+                                  or:
+                                    - lambda: 'return id(voice_assistant_phase) == ${voice_assist_replying_phase_id};'
+                                    # Still holding reply audio. Not speaker.is_playing:
+                                    # the speaker stays "playing" for a while after the
+                                    # audio has drained, so every stop flashed red.
+                                    - lambda: 'return id(media_resampling_speaker)->has_buffered_data();'
+                                then:
+                                  - lambda: 'id(va)->send_interrupt();'
+                                  - speaker.stop:
+                                      id: media_resampling_speaker
+                                  - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+                                  # Red stop-confirmation flash, then the idle ring
+                                  # (phase is idle, so stop_feedback_flash's closing
+                                  # control_leds shows idle).
+                                  - script.execute: stop_feedback_flash
+                                else:
+                                  - lambda: 'id(va)->send_interrupt();'
+                                  - speaker.stop:
+                                      id: media_resampling_speaker
+                                  - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+                                  - script.execute: control_leds
+                                  - logger.log:
+                                      format: "stop after the reply ended: closing quietly (no red flash)"
+                                      level: INFO
                             - micro_wake_word.disable_model: stop
                           else:
                             - logger.log:
