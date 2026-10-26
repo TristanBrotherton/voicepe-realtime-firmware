@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- A "stop" heard after the reply has finished (in the follow-up window, often
+  a misfire on "thanks") ends the turn quietly: the ring goes back to idle with
+  no red flash. The red flash now means a reply that was playing was cut off.
+
 - `va_client` handles the add-on's `output_batch_end` marker: it keeps the
   marker's `output_batch_id` and echoes it in the `turn_metrics` report of the
   reply that drained, so the add-on can confirm which output batch the device
