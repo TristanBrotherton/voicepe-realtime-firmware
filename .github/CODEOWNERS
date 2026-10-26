@@ -1,0 +1,10 @@
+# Changes to CI, dependencies, build and install scripts need the
+# maintainer's review (main's ruleset requires code-owner review).
+/.github/                @TristanBrotherton
+/.gitleaksignore         @TristanBrotherton
+**/requirements*.txt     @TristanBrotherton
+**/pyproject.toml        @TristanBrotherton
+**/package.json          @TristanBrotherton
+**/package-lock.json     @TristanBrotherton
+**/Dockerfile*           @TristanBrotherton
+**/*.sh                  @TristanBrotherton
