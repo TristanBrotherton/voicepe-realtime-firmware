@@ -241,6 +241,9 @@ void VaClient::loop() {
       size_t accepted = this->speaker_->play(this->audio_buf_ + head, contiguous);
       if (accepted > 0) {
         this->last_fed_ms_ = millis();  // keep the chain "warm" for cold-detection
+        if (this->last_reply_fed_ms_ == 0 || this->last_fed_ms_ - this->last_reply_fed_ms_ >= kAudioStretchGapMs)
+          this->audible_stretch_start_ms_ = this->last_fed_ms_;
+        this->last_reply_fed_ms_ = this->last_fed_ms_;
         this->reply_audio_started_this_turn_ = true;
         this->reply_chain_dry_ = false;
         // First real reply sample accepted by the speaker chain this turn (after
@@ -668,6 +671,14 @@ void VaClient::handle_text_(const char *data, size_t len) {
   }
 }
 
+bool VaClient::stop_is_reply_echo(uint32_t min_play_ms) const {
+  if (this->audible_stretch_start_ms_ == 0)
+    return false;
+  const uint32_t now = millis();
+  return now - this->last_reply_fed_ms_ < kEchoTailMs &&
+         now - this->audible_stretch_start_ms_ < min_play_ms;
+}
+
 void VaClient::handle_binary_(const uint8_t *data, size_t len) {
   if (this->speaker_ == nullptr || len < 2 || this->audio_buf_ == nullptr)
     return;
@@ -697,8 +708,6 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
                (unsigned) gap, (unsigned) this->audio_fill_);
     }
   }
-  if (this->last_binary_ms_ == 0 || now_ms - this->last_binary_ms_ >= kAudioStretchGapMs)
-    this->audio_stretch_start_ms_ = now_ms;
   this->last_binary_ms_ = now_ms;
   // PCM16 mono @ 24 kHz, append to ring buffer. loop() drains.
   // Snapshot audio_fill_ under the lock — it's modified by loop() on the
@@ -1254,6 +1263,8 @@ void VaClient::start_session() {
   this->turn_t_listening_ = 0;
   this->turn_t_thinking_ = 0;
   this->turn_t_first_audio_out_ = 0;
+  this->last_reply_fed_ms_ = 0;
+  this->audible_stretch_start_ms_ = 0;
   this->reply_t_anchor_ = this->turn_t_wake_;
   this->reply_t_listening_ = 0;
   this->reply_t_thinking_ = 0;

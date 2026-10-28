@@ -65,11 +65,10 @@ substitutions:
   # when nothing has played for that long. See the stop_cutoff interval.
   stop_cutoff_playing: "128"
   stop_cutoff_quiet: "102"
-  stop_echo_hold_ms: "700"
-  # A stop in the first stop_min_play_ms of a stretch of reply audio is
-  # ignored (the reply's own echo scores like a real stop there). A stretch
-  # starts when audio arrives after a pause (va_client kAudioStretchGapMs), so
-  # "Done." after the "One moment" clip gets its own guard.
+  stop_echo_hold_ms: "800"
+  # A stop in the first stop_min_play_ms of a stretch of reply audio reaching
+  # the speaker is ignored (the reply's own echo scores like a real stop
+  # there): va_client stop_is_reply_echo().
   stop_min_play_ms: "2000"
   # Optional log-only candidate model (packages/wake-word-shadow.yaml): its
   # wake word name. Detections are reported, never start a session.
@@ -332,8 +331,8 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
-  # When the speaker last held audio (millis; 0 = never). Kept by the
-  # stop_cutoff interval and read by the stop handler.
+  # When the speaker last held audio (millis; 0 = never), for the
+  # stop_cutoff interval.
   - id: stop_last_audio_ms
     type: uint32_t
     restore_value: no
@@ -492,8 +491,9 @@ switch:
           id: media_mixing_input
           decibel_reduction: 20
           duration: 0.0s
-      # Enable stop wake word (its cutoff is set by the stop_cutoff interval:
-      # a ringing timer counts as playing)
+      # Enable stop wake word at the strict cutoff at once (the stop_cutoff
+      # interval keeps it while the timer rings)
+      - lambda: 'id(stop).set_probability_cutoff(${stop_cutoff_playing});'
       - micro_wake_word.enable_model: stop
       # Ring timer
       - script.execute: ring_timer
@@ -2236,6 +2236,8 @@ va_client:
         condition:
           lambda: 'return phase == "replying";'
         then:
+          # Strict at once; the stop_cutoff interval keeps it while audio plays.
+          - lambda: 'id(stop).set_probability_cutoff(${stop_cutoff_playing});'
           - micro_wake_word.enable_model: stop
           - script.stop: followup_window_watchdog
     # A turn is in flight ("listening" = the server VAD heard the user speak,
@@ -2481,17 +2483,7 @@ micro_wake_word:
                       # stops at once.)
                       - if:
                           condition:
-                            lambda: |-
-                              // Early in a stretch of reply audio (from frame
-                              // arrival: the speaker chain runs dry between live
-                              // chunks), while it plays or just after.
-                              const uint32_t now = millis();
-                              const uint32_t start = id(va)->audio_stretch_start_ms();
-                              const bool playing = id(media_resampling_speaker)->has_buffered_data() ||
-                                                   id(announcement_resampling_speaker)->has_buffered_data();
-                              const uint32_t last = id(stop_last_audio_ms);
-                              const bool recent = playing || (last != 0 && now - last < ${stop_echo_hold_ms});
-                              return start != 0 && recent && now - start < ${stop_min_play_ms};
+                            lambda: 'return id(va)->stop_is_reply_echo(${stop_min_play_ms});'
                           then:
                             - logger.log:
                                 format: "ignoring 'stop' — in the first ${stop_min_play_ms} ms of playback (reply echo)"
