@@ -125,6 +125,13 @@ class VaClient : public Component {
   // request-follow-up windows all have it set, so a real barge-in still works.
   bool turn_has_reply_audio() const { return this->turn_t_first_audio_out_ != 0; }
 
+  // When the current stretch of reply audio began arriving (millis; 0 = none
+  // yet): the first frame after kAudioStretchGapMs with no audio frames. The
+  // yaml "stop" handler ignores a stop early in a stretch: that is the reply's
+  // own echo, which scores like a real stop. Taken from frame arrival, not
+  // from the speaker chain, which runs dry between live chunks mid-reply.
+  uint32_t audio_stretch_start_ms() const { return this->audio_stretch_start_ms_; }
+
   // Called from the static esp-idf event handler trampoline.
   void on_ws_event(int32_t event_id, void *event_data);
 
@@ -557,6 +564,11 @@ class VaClient : public Component {
   //     dry while we still had PSRAM to feed it — bug or stall in the
   //     downstream side. We log the first underrun per reply.
   uint32_t last_binary_ms_{0};
+  uint32_t audio_stretch_start_ms_{0};
+  // A pause in arriving audio this long starts a new stretch: longer than the
+  // live stream's own stalls (seen up to ~600 ms), shorter than the gap
+  // between a "One moment" clip and the result that follows it.
+  static constexpr uint32_t kAudioStretchGapMs = 800;
   uint32_t ws_gap_count_{0};       // # gaps > kWsGapWarnMs in this turn
   uint32_t ws_gap_max_ms_{0};      // largest gap observed this turn
   uint32_t clipped_samples_{0};    // clipped samples in this turn

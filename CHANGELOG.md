@@ -6,15 +6,19 @@
   ("Done.", "It's on.", the "One moment" clip). Two changes:
   - The "stop" cutoff follows the speaker, not the phase: the stricter
     ~0.50 applies whenever reply, clip, chime or timer audio is playing and
-    for `stop_echo_hold_ms` (1 s) after it drains; the sensitive 0.40 only
+    for `stop_echo_hold_ms` (0.7 s) after it drains; the sensitive 0.40 only
     once it has been quiet that long. The phase went idle while a reply's tail
     still played, and a clip played before "replying", so the 0.40 applied to
     the device's own audio.
-  - A "stop" in the first `stop_min_play_ms` (1.5 s) of continuous playback
-    is ignored. Measured on a Voice PE: the reply's echo scored 0.51-0.63
-    (sliding average) in its first second, real spoken stops 0.57-0.67, so no
-    cutoff separates them; a reply that short has nothing to stop, and a
-    longer one still stops after 1.5 s. A ringing timer still stops at once.
+  - A "stop" in the first `stop_min_play_ms` (2 s) of a stretch of reply audio
+    is ignored. `va_client` marks a stretch when audio arrives after a pause
+    of 0.8 s or more (frame arrival, not the speaker chain, which runs dry
+    between live chunks), so a reply right after the "One moment" clip gets
+    its own guard. Measured on a
+    Voice PE: the reply's echo scored 0.51-0.69 (sliding average) in its first
+    second, real spoken stops 0.57-0.67, so no cutoff separates them; a reply
+    that short has nothing to stop, and a longer one still stops after 2 s. A
+    ringing timer still stops at once.
 
 - A "stop" heard after the reply has finished (in the follow-up window, often
   a misfire on "thanks") ends the turn quietly: the ring goes back to idle with

@@ -697,6 +697,8 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
                (unsigned) gap, (unsigned) this->audio_fill_);
     }
   }
+  if (this->last_binary_ms_ == 0 || now_ms - this->last_binary_ms_ >= kAudioStretchGapMs)
+    this->audio_stretch_start_ms_ = now_ms;
   this->last_binary_ms_ = now_ms;
   // PCM16 mono @ 24 kHz, append to ring buffer. loop() drains.
   // Snapshot audio_fill_ under the lock — it's modified by loop() on the

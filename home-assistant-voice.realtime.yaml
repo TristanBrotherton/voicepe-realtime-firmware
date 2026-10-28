@@ -65,10 +65,12 @@ substitutions:
   # when nothing has played for that long. See the stop_cutoff interval.
   stop_cutoff_playing: "128"
   stop_cutoff_quiet: "102"
-  stop_echo_hold_ms: "1000"
-  # A stop in the first stop_min_play_ms of continuous playback is ignored
-  # (the reply's own echo scores like a real stop there).
-  stop_min_play_ms: "1500"
+  stop_echo_hold_ms: "700"
+  # A stop in the first stop_min_play_ms of a stretch of reply audio is
+  # ignored (the reply's own echo scores like a real stop there). A stretch
+  # starts when audio arrives after a pause (va_client kAudioStretchGapMs), so
+  # "Done." after the "One moment" clip gets its own guard.
+  stop_min_play_ms: "2000"
   # Optional log-only candidate model (packages/wake-word-shadow.yaml): its
   # wake word name. Detections are reported, never start a session.
   shadow_wake_word: "__no_shadow_model__"
@@ -330,12 +332,12 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
-  # True while the speaker has been playing for less than stop_min_play_ms
-  # (kept by the stop_cutoff interval): a "stop" then is the reply's own echo.
-  - id: stop_echo_guard
-    type: bool
+  # When the speaker last held audio (millis; 0 = never). Kept by the
+  # stop_cutoff interval and read by the stop handler.
+  - id: stop_last_audio_ms
+    type: uint32_t
     restore_value: no
-    initial_value: 'false'
+    initial_value: '0'
   # Global variable tracking the phase of the voice assistant (defined above). Initialized to not_ready
   - id: voice_assistant_phase
     type: int
@@ -2323,23 +2325,14 @@ interval:
   - interval: 100ms
     then:
       - lambda: |-
-          static uint32_t last_audio = 0;
-          static uint32_t stretch_start = 0;
-          static bool heard_audio = false;
           static int applied = -1;
           const uint32_t now = millis();
           if (id(media_resampling_speaker)->has_buffered_data() ||
               id(announcement_resampling_speaker)->has_buffered_data() ||
               id(timer_ringing).state) {
-            // A gap shorter than the echo hold is the same stretch of playback.
-            if (!heard_audio || now - last_audio >= ${stop_echo_hold_ms}) stretch_start = now;
-            last_audio = now;
-            heard_audio = true;
+            id(stop_last_audio_ms) = now;
           }
-          const bool echo = heard_audio && now - last_audio < ${stop_echo_hold_ms};
-          // A ringing timer is never the reply's echo: "stop" ends it at once.
-          id(stop_echo_guard) = echo && !id(timer_ringing).state &&
-                                now - stretch_start < ${stop_min_play_ms};
+          const bool echo = id(stop_last_audio_ms) != 0 && now - id(stop_last_audio_ms) < ${stop_echo_hold_ms};
           const int want = echo ? ${stop_cutoff_playing} : ${stop_cutoff_quiet};
           if (want != applied) {
             id(stop).set_probability_cutoff(want);
@@ -2386,10 +2379,12 @@ micro_wake_word:
       # phase-based 0.40 let the device stop itself on its own short replies):
       #   audio playing, or within stop_echo_hold_ms of it → ~0.50 (128)
       #   quiet for longer than that                     → 0.40 (102)
-      # WHY split: during a reply the open mic gets the TTS leak — the common
-      # false stops sit at sliding-avg 0.41-0.49 (logged 0.44/0.46), real
-      # reply-stops at 0.52-0.67, so 0.50 sits in the gap: rejects the echo,
-      # keeps real stops. In the quiet follow-up window there's NO TTS to
+      # WHY split: during a reply the open mic gets the TTS leak. Measured in
+      # June the common false stops sat at sliding-avg 0.41-0.49 and 0.50
+      # rejected them; on 2026-10-28 short replies' echo scored 0.51-0.69 in
+      # their first second (real stops 0.57-0.67), which no cutoff separates,
+      # so the stop handler also ignores a stop in the first stop_min_play_ms
+      # of playback. In the quiet follow-up window there's NO TTS to
       # false-trigger, but real stops dip <0.5 (XMOS AGC recovering from the
       # playback level), so 0.40 catches them. See the stop_cutoff interval.
       # (Before, set per phase at on_phase "replying"/"idle", on_followup_opened
@@ -2475,18 +2470,28 @@ micro_wake_word:
                       # the turn finish clean. (Idle is also covered by the phase
                       # check; turn_has_reply_audio() stays true through the
                       # follow-up window, so a real barge-in there still works.)
-                      # Reply echo: the device's own playback scores 0.51-0.63
+                      # Reply echo: the device's own playback scores 0.51-0.69
                       # on the stop model in its first second (rig
                       # 2026-10-28: "Done.", "It's on.", the "One moment" clip),
                       # the same range as a real stop (0.57-0.67), so no cutoff
                       # separates them. A stop in the first stop_min_play_ms of
-                      # continuous playback is ignored: a reply that short has
+                      # a stretch of playback is ignored: a reply that short has
                       # nothing to stop, and a longer one can still be stopped
-                      # after that. (stop_echo_guard is kept by the stop_cutoff
-                      # interval.)
+                      # after that. (A ringing timer is handled above and still
+                      # stops at once.)
                       - if:
                           condition:
-                            lambda: 'return id(stop_echo_guard);'
+                            lambda: |-
+                              // Early in a stretch of reply audio (from frame
+                              // arrival: the speaker chain runs dry between live
+                              // chunks), while it plays or just after.
+                              const uint32_t now = millis();
+                              const uint32_t start = id(va)->audio_stretch_start_ms();
+                              const bool playing = id(media_resampling_speaker)->has_buffered_data() ||
+                                                   id(announcement_resampling_speaker)->has_buffered_data();
+                              const uint32_t last = id(stop_last_audio_ms);
+                              const bool recent = playing || (last != 0 && now - last < ${stop_echo_hold_ms});
+                              return start != 0 && recent && now - start < ${stop_min_play_ms};
                           then:
                             - logger.log:
                                 format: "ignoring 'stop' — in the first ${stop_min_play_ms} ms of playback (reply echo)"
