@@ -59,6 +59,17 @@ substitutions:
   wake_cutoff_moderate_delta: "18"
   wake_cutoff_very_delta: "33"
   default_wake_sensitivity: "Slightly sensitive"
+  # "stop" cutoffs (uint8 = round(p * 255)). The strict one applies whenever
+  # the speaker holds audio and for stop_echo_hold_ms after it drains (the
+  # i2s buffer and room echo still play then); the sensitive one applies only
+  # when nothing has played for that long. See the stop_cutoff interval.
+  stop_cutoff_playing: "128"
+  stop_cutoff_quiet: "102"
+  stop_echo_hold_ms: "800"
+  # A stop in the first stop_min_play_ms of a stretch of reply audio reaching
+  # the speaker is ignored (the reply's own echo scores like a real stop
+  # there): va_client stop_is_reply_echo().
+  stop_min_play_ms: "2000"
   # Optional log-only candidate model (packages/wake-word-shadow.yaml): its
   # wake word name. Detections are reported, never start a session.
   shadow_wake_word: "__no_shadow_model__"
@@ -320,6 +331,12 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+  # When the speaker last held audio (millis; 0 = never), for the
+  # stop_cutoff interval.
+  - id: stop_last_audio_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
   # Global variable tracking the phase of the voice assistant (defined above). Initialized to not_ready
   - id: voice_assistant_phase
     type: int
@@ -474,11 +491,10 @@ switch:
           id: media_mixing_input
           decibel_reduction: 20
           duration: 0.0s
-      # Enable stop wake word
+      # Enable stop wake word at the strict cutoff at once (the stop_cutoff
+      # interval keeps it while the timer rings)
+      - lambda: 'id(stop).set_probability_cutoff(${stop_cutoff_playing});'
       - micro_wake_word.enable_model: stop
-      # B3: a timer ring is loud audio → use the stricter ~0.50 (128), same as a
-      # reply (single shared cutoff on id(stop), so set it explicitly here).
-      - lambda: 'id(stop).set_probability_cutoff(128);'
       # Ring timer
       - script.execute: ring_timer
       # Refresh LED
@@ -2220,12 +2236,9 @@ va_client:
         condition:
           lambda: 'return phase == "replying";'
         then:
+          # Strict at once; the stop_cutoff interval keeps it while audio plays.
+          - lambda: 'id(stop).set_probability_cutoff(${stop_cutoff_playing});'
           - micro_wake_word.enable_model: stop
-          # B3: TTS is playing → use the stock-default ~0.50 (128) cutoff to
-          # reject the common reply-echo false stops (sliding-avg 0.41-0.49)
-          # while keeping real reply-stops (0.52-0.67). Dropped to 0.40 in the
-          # quiet follow-up/idle window below. (See the stop model comment.)
-          - lambda: 'id(stop).set_probability_cutoff(128);'
           - script.stop: followup_window_watchdog
     # A turn is in flight ("listening" = the server VAD heard the user speak,
     # OR the follow-up window just opened its listening LED): stop the disarm
@@ -2249,9 +2262,6 @@ va_client:
           lambda: 'return phase == "idle";'
         then:
           - micro_wake_word.enable_model: stop
-          # B3: quiet at rest (no TTS) → restore the sensitive 0.40 (102) so weak
-          # real stops in the follow-up window are caught.
-          - lambda: 'id(stop).set_probability_cutoff(102);'
           - script.execute: followup_window_watchdog
   on_repeated_failure:
     # Backend unreachable for N reconnect attempts. SILENT by design (was a
@@ -2305,13 +2315,34 @@ va_client:
     # replying — during follow-up listening the server is silent until
     # the user speaks, so we have to enable it ourselves.
     - micro_wake_word.enable_model: stop
-    # B3: the follow-up window is quiet (the question's TTS + chime finished
-    # before the mic opens) → sensitive 0.40 (102) to catch weak stops.
-    - lambda: 'id(stop).set_probability_cutoff(102);'
     # If the user stays silent, va_client closes the mic at kRequestFollowUpMs
     # but doesn't notify yaml — without this watchdog the LED would stay
     # in listening_for_command forever and `stop` would never disarm.
     - script.execute: followup_window_watchdog
+
+# The one owner of the "stop" cutoff: strict while the speaker holds reply,
+# clip, chime or timer audio and for stop_echo_hold_ms after it drains, the
+# sensitive quiet value only after that.
+interval:
+  - interval: 100ms
+    then:
+      - lambda: |-
+          // Applied every tick (a cheap setter), so a direct set at a reply or
+          // timer start can never leave a stale value behind; logged on change.
+          static int logged = -1;
+          const uint32_t now = millis();
+          if (id(media_resampling_speaker)->has_buffered_data() ||
+              id(announcement_resampling_speaker)->has_buffered_data() ||
+              id(timer_ringing).state) {
+            id(stop_last_audio_ms) = now;
+          }
+          const bool echo = id(stop_last_audio_ms) != 0 && now - id(stop_last_audio_ms) < ${stop_echo_hold_ms};
+          const int want = echo ? ${stop_cutoff_playing} : ${stop_cutoff_quiet};
+          id(stop).set_probability_cutoff(want);
+          if (want != logged) {
+            logged = want;
+            ESP_LOGD("stop_cutoff", "stop cutoff %d (%s)", want, echo ? "audio playing" : "quiet");
+          }
 
 audio_dac:
   - platform: aic3204
@@ -2345,17 +2376,23 @@ micro_wake_word:
     - model: https://github.com/OHF-Voice/micro-wake-word/releases/download/stop/stop.json
       id: stop
       internal: true
-      # The model ships with cutoff 0.5. This baked 0.4 is only the boot/quiet
-      # value; the cutoff is set PER-PHASE at runtime (B3, 2026-06-14):
-      #   reply playing / timer ring → ~0.50 (128) = the stock-firmware default
-      #   quiet follow-up / idle      → 0.40 (102)
-      # WHY split: during a reply the open mic gets the TTS leak — the common
-      # false stops sit at sliding-avg 0.41-0.49 (logged 0.44/0.46), real
-      # reply-stops at 0.52-0.67, so 0.50 sits in the gap: rejects the echo,
-      # keeps real stops. In the quiet follow-up window there's NO TTS to
+      # The model ships with cutoff 0.5. This baked 0.4 is only the boot
+      # value; the stop_cutoff interval sets it from what the SPEAKER is doing
+      # (not from the phase: the phase goes idle while the reply's tail still
+      # plays, and a short reply or clip plays before "replying", so a
+      # phase-based 0.40 let the device stop itself on its own short replies):
+      #   audio playing, or within stop_echo_hold_ms of it → ~0.50 (128)
+      #   quiet for longer than that                     → 0.40 (102)
+      # WHY split: during a reply the open mic gets the TTS leak. Measured in
+      # June the common false stops sat at sliding-avg 0.41-0.49 and 0.50
+      # rejected them; on 2026-10-28 short replies' echo scored 0.51-0.69 in
+      # their first second (real stops 0.57-0.67), which no cutoff separates,
+      # so the stop handler also ignores a stop in the first stop_min_play_ms
+      # of playback. In the quiet follow-up window there's NO TTS to
       # false-trigger, but real stops dip <0.5 (XMOS AGC recovering from the
-      # playback level), so 0.40 catches them. See the set_probability_cutoff
-      # calls at on_phase "replying"/"idle", on_followup_opened, timer.on_turn_on.
+      # playback level), so 0.40 catches them. See the stop_cutoff interval.
+      # (Before, set per phase at on_phase "replying"/"idle", on_followup_opened
+      # and timer.on_turn_on.)
       # HISTORY: B1 (da126a4, reverted) used 0.55 → missed real 0.52 stops; 0.50
       # (= stock's value, which "just works") fixes that. RESIDUAL (accepted):
       # a rare CONTENT self-trigger — the TTS genuinely pronouncing a stop-like
@@ -2363,7 +2400,7 @@ micro_wake_word:
       # match for the model and NO cutoff can reject it (real 0.52-0.65 and that
       # 0.65 overlap; both i2s channels are equally AEC'd, no cleaner tap). It is
       # far rarer than the 0.44-0.49 cluster that 0.50 now removes.
-      # TUNING KNOB: adjust the per-phase 128/102 values (uint8 = round(p*255)).
+      # TUNING KNOB: stop_cutoff_playing / stop_cutoff_quiet / stop_echo_hold_ms.
       probability_cutoff: 0.4
   # Permissive VAD gate. With the default threshold the VAD model repeatedly
   # vetoed REAL stop detections — device log shows "Wake word model predicts
@@ -2437,46 +2474,63 @@ micro_wake_word:
                       # the turn finish clean. (Idle is also covered by the phase
                       # check; turn_has_reply_audio() stays true through the
                       # follow-up window, so a real barge-in there still works.)
+                      # Reply echo: the device's own playback scores 0.51-0.69
+                      # on the stop model in its first second (rig
+                      # 2026-10-28: "Done.", "It's on.", the "One moment" clip),
+                      # the same range as a real stop (0.57-0.67), so no cutoff
+                      # separates them. A stop in the first stop_min_play_ms of
+                      # a stretch of playback is ignored: a reply that short has
+                      # nothing to stop, and a longer one can still be stopped
+                      # after that. (A ringing timer is handled above and still
+                      # stops at once.)
                       - if:
                           condition:
-                            lambda: 'return id(voice_assistant_phase) != ${voice_assist_idle_phase_id} && id(va)->turn_has_reply_audio();'
+                            lambda: 'return id(va)->stop_is_reply_echo(${stop_min_play_ms});'
                           then:
-                            # Red only when a reply was actually cut off. A stop
-                            # in the follow-up window after the reply has finished
-                            # (often a misfire on "thanks") ends the turn quietly:
-                            # the ring just goes back to idle.
+                            - logger.log:
+                                format: "ignoring 'stop' — in the first ${stop_min_play_ms} ms of playback (reply echo)"
+                                level: INFO
+                          else:
                             - if:
                                 condition:
-                                  or:
-                                    - lambda: 'return id(voice_assistant_phase) == ${voice_assist_replying_phase_id};'
-                                    # Still holding reply audio. Not speaker.is_playing:
-                                    # the speaker stays "playing" for a while after the
-                                    # audio has drained, so every stop flashed red.
-                                    - lambda: 'return id(media_resampling_speaker)->has_buffered_data();'
+                                  lambda: 'return id(voice_assistant_phase) != ${voice_assist_idle_phase_id} && id(va)->turn_has_reply_audio();'
                                 then:
-                                  - lambda: 'id(va)->send_interrupt();'
-                                  - speaker.stop:
-                                      id: media_resampling_speaker
-                                  - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
-                                  # Red stop-confirmation flash, then the idle ring
-                                  # (phase is idle, so stop_feedback_flash's closing
-                                  # control_leds shows idle).
-                                  - script.execute: stop_feedback_flash
+                                  # Red only when a reply was actually cut off. A stop
+                                  # in the follow-up window after the reply has finished
+                                  # (often a misfire on "thanks") ends the turn quietly:
+                                  # the ring just goes back to idle.
+                                  - if:
+                                      condition:
+                                        or:
+                                          - lambda: 'return id(voice_assistant_phase) == ${voice_assist_replying_phase_id};'
+                                          # Still holding reply audio. Not speaker.is_playing:
+                                          # the speaker stays "playing" for a while after the
+                                          # audio has drained, so every stop flashed red.
+                                          - lambda: 'return id(media_resampling_speaker)->has_buffered_data();'
+                                      then:
+                                        - lambda: 'id(va)->send_interrupt();'
+                                        - speaker.stop:
+                                            id: media_resampling_speaker
+                                        - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+                                        # Red stop-confirmation flash, then the idle ring
+                                        # (phase is idle, so stop_feedback_flash's closing
+                                        # control_leds shows idle).
+                                        - script.execute: stop_feedback_flash
+                                      else:
+                                        - lambda: 'id(va)->send_interrupt();'
+                                        - speaker.stop:
+                                            id: media_resampling_speaker
+                                        - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+                                        - script.execute: control_leds
+                                        - logger.log:
+                                            format: "stop after the reply ended: closing quietly (no red flash)"
+                                            level: INFO
+                                  - micro_wake_word.disable_model: stop
                                 else:
-                                  - lambda: 'id(va)->send_interrupt();'
-                                  - speaker.stop:
-                                      id: media_resampling_speaker
-                                  - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
-                                  - script.execute: control_leds
                                   - logger.log:
-                                      format: "stop after the reply ended: closing quietly (no red flash)"
+                                      format: "ignoring 'stop' — no reply audio yet (phase=%d), nothing to stop"
+                                      args: ['id(voice_assistant_phase)']
                                       level: INFO
-                            - micro_wake_word.disable_model: stop
-                          else:
-                            - logger.log:
-                                format: "ignoring 'stop' — no reply audio yet (phase=%d), nothing to stop"
-                                args: ['id(voice_assistant_phase)']
-                                level: INFO
                     else:
                       # Non-stop wake word: stamp the detection first. The wake
                       # message reports how long chime + echo guard took (fire

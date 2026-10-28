@@ -125,6 +125,14 @@ class VaClient : public Component {
   // request-follow-up windows all have it set, so a real barge-in still works.
   bool turn_has_reply_audio() const { return this->turn_t_first_audio_out_ != 0; }
 
+  // True when a "stop" is most likely the reply's own echo, which scores like
+  // a real stop: within min_play_ms of the start of the current stretch of
+  // reply audio reaching the speaker chain (after the prebuffer and prime; a
+  // stretch starts after kAudioStretchGapMs with none fed, so "Done." after
+  // the "One moment" clip gets its own), while that audio is still playing or
+  // its tail is (kEchoTailMs).
+  bool stop_is_reply_echo(uint32_t min_play_ms) const;
+
   // Called from the static esp-idf event handler trampoline.
   void on_ws_event(int32_t event_id, void *event_data);
 
@@ -557,6 +565,19 @@ class VaClient : public Component {
   //     dry while we still had PSRAM to feed it — bug or stall in the
   //     downstream side. We log the first underrun per reply.
   uint32_t last_binary_ms_{0};
+  // stop_is_reply_echo(): when reply audio was last fed to the speaker chain,
+  // and when the current stretch of it began (millis; 0 = none this session).
+  uint32_t last_reply_fed_ms_{0};
+  uint32_t audible_stretch_start_ms_{0};
+  // A pause this long in feeding reply audio starts a new stretch: longer
+  // than the live stream's own stalls (seen up to ~600 ms), shorter than the
+  // gap between a "One moment" clip and the result that follows it.
+  static constexpr uint32_t kAudioStretchGapMs = 800;
+  // The last fed audio is still audible this long: the speaker chain holds
+  // ~600 ms beyond the last feed (i2s 500 ms plus resampler/mixer), then room
+  // echo and the stop model's sliding window. Keep the yaml stop_echo_hold_ms
+  // (measured from the chain draining) at or above kAudioStretchGapMs.
+  static constexpr uint32_t kEchoTailMs = 1600;
   uint32_t ws_gap_count_{0};       // # gaps > kWsGapWarnMs in this turn
   uint32_t ws_gap_max_ms_{0};      // largest gap observed this turn
   uint32_t clipped_samples_{0};    // clipped samples in this turn
