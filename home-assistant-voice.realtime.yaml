@@ -2327,7 +2327,9 @@ interval:
   - interval: 100ms
     then:
       - lambda: |-
-          static int applied = -1;
+          // Applied every tick (a cheap setter), so a direct set at a reply or
+          // timer start can never leave a stale value behind; logged on change.
+          static int logged = -1;
           const uint32_t now = millis();
           if (id(media_resampling_speaker)->has_buffered_data() ||
               id(announcement_resampling_speaker)->has_buffered_data() ||
@@ -2336,9 +2338,9 @@ interval:
           }
           const bool echo = id(stop_last_audio_ms) != 0 && now - id(stop_last_audio_ms) < ${stop_echo_hold_ms};
           const int want = echo ? ${stop_cutoff_playing} : ${stop_cutoff_quiet};
-          if (want != applied) {
-            id(stop).set_probability_cutoff(want);
-            applied = want;
+          id(stop).set_probability_cutoff(want);
+          if (want != logged) {
+            logged = want;
             ESP_LOGD("stop_cutoff", "stop cutoff %d (%s)", want, echo ? "audio playing" : "quiet");
           }
 

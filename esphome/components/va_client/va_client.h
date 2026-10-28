@@ -573,9 +573,11 @@ class VaClient : public Component {
   // than the live stream's own stalls (seen up to ~600 ms), shorter than the
   // gap between a "One moment" clip and the result that follows it.
   static constexpr uint32_t kAudioStretchGapMs = 800;
-  // The last fed audio is still audible this long: the i2s buffer (500 ms),
-  // room echo and the stop model's sliding window.
-  static constexpr uint32_t kEchoTailMs = 1200;
+  // The last fed audio is still audible this long: the speaker chain holds
+  // ~600 ms beyond the last feed (i2s 500 ms plus resampler/mixer), then room
+  // echo and the stop model's sliding window. Keep the yaml stop_echo_hold_ms
+  // (measured from the chain draining) at or above kAudioStretchGapMs.
+  static constexpr uint32_t kEchoTailMs = 1600;
   uint32_t ws_gap_count_{0};       // # gaps > kWsGapWarnMs in this turn
   uint32_t ws_gap_max_ms_{0};      // largest gap observed this turn
   uint32_t clipped_samples_{0};    // clipped samples in this turn
