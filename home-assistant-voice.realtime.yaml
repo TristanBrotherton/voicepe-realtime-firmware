@@ -2476,7 +2476,7 @@ micro_wake_word:
                       # check; turn_has_reply_audio() stays true through the
                       # follow-up window, so a real barge-in there still works.)
                       # Reply echo: the device's own playback scores 0.51-0.63
-                      # on the stop model in its first second (Garage
+                      # on the stop model in its first second (rig
                       # 2026-10-28: "Done.", "It's on.", the "One moment" clip),
                       # the same range as a real stop (0.57-0.67), so no cutoff
                       # separates them. A stop in the first stop_min_play_ms of
