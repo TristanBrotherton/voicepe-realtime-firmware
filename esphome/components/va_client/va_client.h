@@ -328,6 +328,7 @@ class VaClient : public Component {
   TaskHandle_t text_tx_task_{nullptr};
   std::atomic<uint32_t> conn_gen_{0};
   std::atomic<uint32_t> text_tx_dropped_{0};
+  std::atomic<bool> text_tx_sending_{false};  // the sender holds a received item
   // millis() of the last failed WebSocket write (either sender); 0 = none.
   // A disconnect right after one is reported as why "tx_timeout".
   std::atomic<uint32_t> last_tx_fail_ms_{0};

@@ -1034,6 +1034,16 @@ void VaClient::mic_tx_loop_() {
     }
     if (item == nullptr)
       continue;
+    // Text frames queued before this mic frame go first: a turn's `wake` and
+    // `interrupt` were written synchronously before its first mic frame and
+    // the add-on may rely on that order. Bounded wait (about 100 ms).
+    for (int i = 0; i < 50 && this->text_tx_task_ != nullptr; i++) {
+      UBaseType_t waiting = 0;
+      vRingbufferGetInfo(this->text_tx_rb_, nullptr, nullptr, nullptr, nullptr, &waiting);
+      if (waiting == 0 && !this->text_tx_sending_.load())
+        break;
+      vTaskDelay(pdMS_TO_TICKS(2));
+    }
     auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
     if (this->ws_connected_ && handle != nullptr) {
       const uint32_t t0 = millis();
@@ -1619,6 +1629,7 @@ void VaClient::text_tx_loop_() {
     void *item = xRingbufferReceive(this->text_tx_rb_, &len, pdMS_TO_TICKS(500));
     if (item == nullptr)
       continue;
+    this->text_tx_sending_ = true;
     uint32_t gen = 0;
     if (len >= sizeof(gen))
       std::memcpy(&gen, item, sizeof(gen));
@@ -1638,6 +1649,7 @@ void VaClient::text_tx_loop_() {
     }
     // Stale (earlier connection) or not connected: dropped.
     vRingbufferReturnItem(this->text_tx_rb_, item);
+    this->text_tx_sending_ = false;
   }
 }
 
