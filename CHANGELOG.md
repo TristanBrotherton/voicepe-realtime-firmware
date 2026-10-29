@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- WebSocket frames split across TCP reads are put back together before use.
+  The ESP-IDF client posts one data event per read, and a read returns
+  whatever has arrived, so a frame can come in several pieces of any length.
+  - Text frames are parsed only once whole (`ws_rx.h`). Each piece used to be
+    parsed on its own, so a split `utt_end` never ended its utterance (the
+    device never sent `done`), and a split phase or `interrupt_ack` was lost.
+  - A 16-bit sample split between two pieces of PCM is kept whole. The odd
+    byte used to be dropped: two bytes lost per split (`done` reported `fed`
+    a few bytes short of `bytes`) and the rest of that piece shifted by a
+    byte, which played as a short burst of noise.
+  - Host check: `tools/ci/test_ws_rx.cpp`, run in CI.
+- Safety net for a lost `utt_end`: an utterance fully played with no audio
+  for 20 s is ended with what it received and reported `done`, so every
+  utterance gets an outcome.
+
 - Text frames no longer drop the connection on a short network stall. Every
   text frame the device sends (`start`, `wake`, `interrupt`, `flush`,
   `turn_metrics`, button and flag messages, trigger audio, utterance acks)

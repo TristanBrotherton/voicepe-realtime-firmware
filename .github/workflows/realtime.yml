@@ -43,6 +43,13 @@ jobs:
       - name: Public-surface scan
         run: python tools/ci/public_scan.py
 
+      - name: Host check (WebSocket frame reassembly, ws_rx.h)
+        run: |
+          mkdir -p build
+          c++ -std=c++17 -Wall -Wextra -Werror -I esphome/components/va_client \
+            tools/ci/test_ws_rx.cpp -o build/test_ws_rx
+          build/test_ws_rx
+
       - name: YAML lint
         run: |
           python -m pip install --quiet yamllint==1.37.1
