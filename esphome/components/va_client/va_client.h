@@ -14,6 +14,8 @@
 #include <freertos/ringbuf.h>
 #include <freertos/task.h>
 
+#include "ws_rx.h"
+
 namespace esphome {
 namespace va_client {
 
@@ -173,7 +175,9 @@ class VaClient : public Component {
   // session open — see preroll_discard_pending_.
   void preroll_push_(const int16_t *data, size_t n);
   void handle_text_(const char *data, size_t len);
-  void handle_binary_(const uint8_t *data, size_t len);
+  // One piece of a binary frame (frame_start: payload_offset 0). Samples
+  // split across pieces are kept whole (pcm_rx_).
+  void handle_binary_(const uint8_t *data, size_t len, bool frame_start);
   void set_phase_(const std::string &phase);
   // Marshal a phase-LED trigger fire onto the main loop (used to drive the LED
   // ring to `listening`/`idle` from timer callbacks during the follow-up window,
@@ -395,6 +399,11 @@ class VaClient : public Component {
   std::atomic<uint32_t> utt_discard_seq_{0};
   uint32_t utt_discard_since_ms_{0};
   static constexpr uint32_t kUttDiscardMaxMs = 10000;  // safety net if an ack is lost
+  // Safety net if an utt_end is lost: an open utterance fully played with no
+  // audio received for this long is ended with what it has (utt_service_).
+  // Longer than any pause the add-on keeps open inside a reply (12 s).
+  static constexpr uint32_t kUttOpenIdleMaxMs = 20000;
+  std::atomic<uint32_t> last_pcm_rx_ms_{0};  // WS task writes, loop() reads
   uint32_t interrupt_seq_{0};
   // Latest finished utterance (for interrupt utt/fed and prev_utt).
   bool last_utt_valid_{false};
@@ -635,6 +644,13 @@ class VaClient : public Component {
   // Tracks the opcode of the in-flight WS message so we can route
   // continuation frames (op_code = 0) to the same handler.
   bool last_data_was_binary_{false};
+  // WS task only. esp_websocket_client delivers a frame in as many pieces as
+  // TCP reads return (ws_rx.h): text frames are parsed whole, and a sample
+  // split between two pieces of PCM is kept whole.
+  static constexpr size_t kTextRxMaxBytes = 16 * 1024;
+  WsTextAssembler text_rx_{kTextRxMaxBytes};
+  PcmAligner pcm_rx_;
+  std::string text_rx_msg_;
 
   // Output volume multiplier in [0, 1], updated from yaml whenever
   // external_media_player.volume / mute changes. Defaults to 1.0 so a

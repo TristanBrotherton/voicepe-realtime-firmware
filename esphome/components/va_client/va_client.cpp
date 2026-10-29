@@ -493,6 +493,8 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
       this->utt_mode_ = false;
       this->utt_discarding_ = false;
       this->interrupt_seq_ = 0;
+      this->text_rx_.reset();
+      this->pcm_rx_.reset();
       {
         bool have = false;
         uint32_t id = 0, fed = 0, bytes = 0;
@@ -560,23 +562,38 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
       if (data == nullptr || data->data_ptr == nullptr || data->data_len <= 0)
         break;
       // op_code: 0x01 = text, 0x02 = binary, 0x00 = continuation of the prior
-      // frame. esp_websocket_client splits long messages, so we must track the
-      // type from the first chunk and feed continuations to the same handler.
+      // frame. esp_websocket_client posts one event per transport read, so
+      // one frame can arrive in several pieces of any length (TCP decides):
+      // payload_offset/payload_len place each piece in its frame. Text is
+      // parsed only once its frame is whole, and PCM samples split between
+      // pieces are kept whole (ws_rx.h). Parsing each piece on its own lost a
+      // split `utt_end` (its utterance never finished: no `done`) and cost
+      // a byte per odd split (`fed` short of `bytes`, and the rest of that
+      // piece shifted by a byte: a burst of noise).
       uint8_t op = data->op_code;
+      const size_t len = static_cast<size_t>(data->data_len);
+      const size_t offset = data->payload_offset > 0 ? static_cast<size_t>(data->payload_offset) : 0;
+      const size_t total = data->payload_len > 0 ? static_cast<size_t>(data->payload_len) : len;
+      bool binary;
       if (op == 0x01) {
-        this->last_data_was_binary_ = false;
-        this->handle_text_(data->data_ptr, static_cast<size_t>(data->data_len));
+        binary = false;
       } else if (op == 0x02) {
-        this->last_data_was_binary_ = true;
-        this->handle_binary_(reinterpret_cast<const uint8_t *>(data->data_ptr),
-                             static_cast<size_t>(data->data_len));
+        binary = true;
       } else if (op == 0x00) {
-        // Continuation. Route based on the type of the in-flight message.
-        if (this->last_data_was_binary_) {
-          this->handle_binary_(reinterpret_cast<const uint8_t *>(data->data_ptr),
-                               static_cast<size_t>(data->data_len));
-        } else {
-          this->handle_text_(data->data_ptr, static_cast<size_t>(data->data_len));
+        binary = this->last_data_was_binary_;  // continuation of the in-flight message
+      } else {
+        break;
+      }
+      this->last_data_was_binary_ = binary;
+      if (binary) {
+        this->handle_binary_(reinterpret_cast<const uint8_t *>(data->data_ptr), len, offset == 0);
+      } else {
+        const uint32_t dropped_before = this->text_rx_.dropped();
+        if (this->text_rx_.feed(data->data_ptr, len, offset, total, this->text_rx_msg_)) {
+          this->handle_text_(this->text_rx_msg_.data(), this->text_rx_msg_.size());
+        } else if (this->text_rx_.dropped() != dropped_before) {
+          ESP_LOGW(TAG, "text frame of %u bytes dropped (too large or a piece missing)",
+                   (unsigned) total);
         }
       }
       break;
@@ -818,8 +835,8 @@ bool VaClient::stop_is_reply_echo(uint32_t min_play_ms) const {
          now - this->audible_stretch_start_ms_ < min_play_ms;
 }
 
-void VaClient::handle_binary_(const uint8_t *data, size_t len) {
-  if (this->speaker_ == nullptr || len < 2 || this->audio_buf_ == nullptr)
+void VaClient::handle_binary_(const uint8_t *data, size_t len, bool frame_start) {
+  if (this->speaker_ == nullptr || len == 0 || this->audio_buf_ == nullptr)
     return;
   // After a "stop"/barge-in (send_interrupt) the backend is still streaming the
   // rest of the already-generated reply. Drop it so the cancelled reply goes
@@ -829,9 +846,12 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
   // interrupt_ack is dropped (the interrupt epoch). Legacy: drop until the
   // next `listening` phase.
   if (this->utt_mode_.load()) {
-    if (this->utt_discarding_.load())
+    if (this->utt_discarding_.load()) {
+      this->pcm_rx_.reset();
       return;
+    }
   } else if (this->suppress_incoming_audio_) {
+    this->pcm_rx_.reset();
     return;
   }
   const uint32_t now_ms = millis();
@@ -856,6 +876,40 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
   }
   this->last_binary_ms_ = now_ms;
   // PCM16 mono @ 24 kHz, append to ring buffer. loop() drains.
+  // Apply user-controlled volume from external_media_player before writing to
+  // the ring. volume_ is set from yaml on every media_player volume / mute
+  // change. With vol ≤ 1 there is no mathematical way to overflow int16, but
+  // we keep a defensive saturation + clipped_samples_ counter so any future
+  // gain re-introduction shows up in the per-turn summary instead of silently
+  // distorting.
+  // Scale into tts_buf_ — NOT mono_buf_: that vector is owned by the mic
+  // task (on_mic_data_ refills it on every mic frame, and the mic never
+  // stops while mWW runs), whereas we're on the WS task. Sharing one vector
+  // raced the two tasks (concurrent resize/realloc + interleaved writes),
+  // putting mic samples / freed memory into the TTS ring — audible as hiss.
+  // Samples come whole from pcm_rx_: a byte left over from the previous
+  // piece of this frame joins this piece's first byte (ws_rx.h).
+  this->tts_buf_.resize(len / 2 + 1);
+  float vol = this->volume_;
+  if (vol < 0.0f) vol = 0.0f;
+  else if (vol > 1.0f) vol = 1.0f;
+  // Q15 fixed point so the inner loop stays integer-only.
+  const int32_t scale = static_cast<int32_t>(vol * 32768.0f);
+  uint32_t clipped = 0;
+  int16_t *out = this->tts_buf_.data();
+  size_t pairs = 0;
+  this->pcm_rx_.feed(data, len, frame_start, [&](int16_t s) {
+    int32_t v = (static_cast<int32_t>(s) * scale) >> 15;
+    if (v > 32767) { v = 32767; clipped++; }
+    else if (v < -32768) { v = -32768; clipped++; }
+    out[pairs++] = static_cast<int16_t>(v);
+  });
+  this->clipped_samples_ += clipped;
+  this->last_pcm_rx_ms_ = now_ms;
+  if (pairs == 0)
+    return;  // a single byte: it waits for the rest of its sample
+  data = reinterpret_cast<const uint8_t *>(out);
+  len = pairs * 2;
   // Snapshot audio_fill_ under the lock — it's modified by loop() on the
   // other core and we can't trust a torn read.
   size_t free_space;
@@ -865,41 +919,9 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
   if (len > free_space) {
     ESP_LOGW(TAG, "audio buffer overflow: dropping %u bytes (have %u free of %u total)",
              (unsigned) (len - free_space), (unsigned) free_space, (unsigned) kAudioBufBytes);
-    len = free_space;
+    len = free_space & ~static_cast<size_t>(1);
     if (len == 0)
       return;
-  }
-  // Apply user-controlled volume from external_media_player before writing to
-  // the ring. volume_ is set from yaml on every media_player volume / mute
-  // change. With vol ≤ 1 there is no mathematical way to overflow int16, but
-  // we keep a defensive saturation + clipped_samples_ counter so any future
-  // gain re-introduction shows up in the per-turn summary instead of silently
-  // distorting.
-  size_t pairs = len / 2;
-  if (pairs > 0) {
-    auto *in = reinterpret_cast<const int16_t *>(data);
-    // Scale into tts_buf_ — NOT mono_buf_: that vector is owned by the mic
-    // task (on_mic_data_ refills it on every mic frame, and the mic never
-    // stops while mWW runs), whereas we're on the WS task. Sharing one vector
-    // raced the two tasks (concurrent resize/realloc + interleaved writes),
-    // putting mic samples / freed memory into the TTS ring — audible as hiss.
-    this->tts_buf_.resize(pairs);
-    float vol = this->volume_;
-    if (vol < 0.0f) vol = 0.0f;
-    else if (vol > 1.0f) vol = 1.0f;
-    // Q15 fixed point so the inner loop stays integer-only.
-    int32_t scale = static_cast<int32_t>(vol * 32768.0f);
-    uint32_t clipped = 0;
-    for (size_t i = 0; i < pairs; i++) {
-      int32_t v = (static_cast<int32_t>(in[i]) * scale) >> 15;
-      if (v > 32767) { v = 32767; clipped++; }
-      else if (v < -32768) { v = -32768; clipped++; }
-      this->tts_buf_[i] = static_cast<int16_t>(v);
-    }
-    this->clipped_samples_ += clipped;
-    data = reinterpret_cast<const uint8_t *>(this->tts_buf_.data());
-    // len is unchanged (pairs * 2 == len rounded down; trailing odd byte ignored).
-    len = pairs * 2;
   }
   // Two-part write: from tail to end, then wrap to start.
   // We need a stable snapshot of audio_tail_ for the memcpy destination,
@@ -2234,6 +2256,7 @@ void VaClient::utt_service_(uint32_t now_ms, bool chain_dry) {
   size_t n = 0;
   bool anchor = false;
   int announce_change = -1;  // -1 none, 1 started, 0 ended
+  int64_t closed_idle = -1;   // an utterance ended by the safety net below
   portENTER_CRITICAL(&this->ring_mux_);
   const uint64_t out = this->ring_out_total_;
   bool any_playing = false;
@@ -2290,6 +2313,21 @@ void VaClient::utt_service_(uint32_t now_ms, bool chain_dry) {
           if (!u->orphan && n < kMaxUtts * 2)
             ev[n++] = UttEvent{u->id, UttState::PLAYING, true, announce, fed, 0, 0};
         }
+        // Safety net: an utterance whose end never arrived, with everything
+        // it received played and no audio for kUttOpenIdleMaxMs, is ended
+        // with what it has (reported done, fed = what was received), so no
+        // utterance is left without an outcome.
+        // (Signed: the WS task can stamp last_pcm_rx_ms_ after now_ms was read.)
+        if (!u->ended && out >= this->ring_in_total_ &&
+            static_cast<int32_t>(now_ms - this->last_pcm_rx_ms_.load()) >=
+                static_cast<int32_t>(kUttOpenIdleMaxMs)) {
+          u->ended = true;
+          u->end_off = this->ring_in_total_;
+          u->declared = static_cast<uint32_t>(u->end_off - u->start_off);
+          if (this->open_utt_ >= 0 && &this->utts_[this->open_utt_] == u)
+            this->open_utt_ = -1;
+          closed_idle = u->id;
+        }
       }
     }
   }
@@ -2304,6 +2342,9 @@ void VaClient::utt_service_(uint32_t now_ms, bool chain_dry) {
     this->utt_count_--;
   }
   portEXIT_CRITICAL(&this->ring_mux_);
+  if (closed_idle >= 0)
+    ESP_LOGW(TAG, "utt %u: no utt_end and no audio for %u ms; ended with what it received",
+             (unsigned) closed_idle, (unsigned) kUttOpenIdleMaxMs);
   if (anchor) {
     // Echo guard anchored at this utterance's first fed byte.
     this->audible_stretch_start_ms_ = now_ms;
