@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Short replies are heard. A reply that starts on a cold speaker chain now
+  begins with 200 ms of silence instead of 60 ms. With 60 ms a short reply
+  ("Done.", "It's on.") was often not heard at all and longer replies lost
+  their first word. Measured on a Voice PE over 8 short-reply turns each:
+  every reply heard in full with 200 ms (and with 400 ms), against several
+  lost or clipped with 60 ms. Cost: about 90 ms more before the first word.
 - The device no longer stops itself on the echo of its own short replies
   ("Done.", "It's on.", the "One moment" clip). Two changes:
   - The "stop" cutoff follows the speaker, not the phase: the stricter

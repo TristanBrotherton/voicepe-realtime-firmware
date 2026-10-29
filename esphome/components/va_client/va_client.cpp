@@ -166,14 +166,14 @@ void VaClient::loop() {
       // post-speaker.stop — the precise signal) OR, as a backup, nothing fed for
       // > kChainColdMs. is_stopped() closes the window the timer alone misses: a reply
       // whose audio lands < kChainColdMs after a speaker.stop (the residual click). A
-      // needless prime on an already-warm chain is harmless (60ms of silence); both
+      // needless prime on an already-warm chain is harmless (kChainPrimeMs of silence); both
       // signals are only ever true at a real cold reply-start, never mid-speech. The
       // real audio waits safely in PSRAM (and builds a small cushion) until priming done.
       {
         const uint32_t now_ms = millis();
         // Startup-only fallback. A long tool pause can exceed kChainColdMs
         // without stopping the resampler; re-priming after real reply audio
-        // has started would insert a fabricated 60 ms gap mid-sentence.
+        // has started would insert a fabricated gap mid-sentence.
         const bool resampler_cold = !this->reply_audio_started_this_turn_ &&
                                     (this->speaker_->is_stopped() ||
                                      this->last_fed_ms_ == 0 ||

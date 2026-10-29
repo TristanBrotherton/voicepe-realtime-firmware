@@ -431,8 +431,12 @@ class VaClient : public Component {
   // At reply start, cold = resampler is_stopped() (precise, true exactly
   // post-speaker.stop) OR, as a backup, nothing fed for > kChainColdMs. The
   // timer fallback is disabled after the first real PCM is accepted so a long
-  // tool pause cannot fabricate a 60 ms prime in the middle of speech.
-  static constexpr uint32_t kChainPrimeMs = 60;   // silence burst to warm the filter
+  // tool pause cannot fabricate a prime in the middle of speech.
+  // 200 ms, not the original 60: with 60 ms a short reply ("Done.") was
+  // often not heard at all and longer ones lost their first word; 200 ms of
+  // silence first fixed both on a Voice PE for about 90 ms more latency
+  // before the first word (400 ms also fixed it, for about 410 ms).
+  static constexpr uint32_t kChainPrimeMs = 200;  // silence lead at a cold reply start
   static constexpr uint32_t kChainColdMs = 600;   // backup timer; is_stopped() is the primary signal
   // Bytes of silence still to feed this cold-start (24kHz mono 16-bit). >0 while
   // priming; loop() feeds silence and holds real-audio drain until it reaches 0.
