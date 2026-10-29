@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+- Text frames no longer drop the connection on a short network stall. Every
+  text frame the device sends (`start`, `wake`, `interrupt`, `flush`,
+  `turn_metrics`, button and flag messages, trigger audio, utterance acks)
+  now goes through one FIFO and a sender task that writes with a 1.5 s
+  timeout. Before, several were written with a 100-200 ms timeout, and the
+  ESP-IDF WebSocket client treats a write that times out as a network error
+  and aborts the connection (the mic path was already fixed this way). Other
+  sends waited forever on the main loop or the WebSocket task. One FIFO also
+  keeps their order.
+- `start` now says what the device can do and why the last connection ended:
+  `{"type":"start","caps":["ireason1","utt1"],"fw":...,"last_disconnect":
+  {"why":"ws_error|ws_closed|wifi|tx_timeout|reboot",...},"prev_utt":{...}}`.
+  Add-ons that don't know the fields ignore them.
+- Every `interrupt` names its reason (`stop`, `wake`, `button`, `mute`,
+  `no_speech`, `residual`) and carries a per-connection `seq`, so an add-on
+  can treat a spoken "stop" differently from a barge-in wake or housekeeping.
+  yaml: `send_interrupt("stop")` etc.; `send_interrupt()` without a reason
+  still works.
+- Utterance framing (`utt1`), used only when the add-on sends it:
+  - `utt_start{id,kind,turn}` / PCM / `utt_end{id,bytes}` frame each piece of
+    speech; the device tracks each utterance over its playback ring and acks
+    it with `utt_ack` (`playing` with `wait_ms`, `progress` every second,
+    `done`, `cut` or `dropped`, with the bytes fed to the speaker and the
+    underruns).
+  - After a device interrupt every utterance frame is dropped until the
+    add-on's `interrupt_ack{seq}`; the interrupt carries the playing
+    utterance and how much of it was fed.
+  - Per-utterance start: an utterance that starts on a cold speaker chain
+    gets the silence lead (hello `chain_prime_ms`, default 200 ms) and,
+    optionally, a start cushion (hello `utt_cushion_ms`, default 0); one that
+    follows another back to back gets neither, so a clip flows into its
+    result without a gap.
+  - The stop-echo guard is anchored at each utterance's first fed byte.
+  - "stop" is armed while an `announce` utterance (a timer line) plays and
+    for 10 s after it, and is sent as `interrupt{reason:"stop"}`, so the
+    add-on knows the announcement was heard. yaml: `on_announce`.
+  Without `utt_start` from the add-on, playback is unchanged (prebuffer,
+  prime once per turn, incoming audio dropped after an interrupt until the
+  next `listening`).
 - Short replies are heard. A reply that starts on a cold speaker chain now
   begins with 200 ms of silence instead of 60 ms. With 60 ms a short reply
   ("Done.", "It's on.") was often not heard at all and longer replies lost

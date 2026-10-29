@@ -18,6 +18,7 @@ CONF_ON_PHASE = "on_phase"
 CONF_ON_REPEATED_FAILURE = "on_repeated_failure"
 CONF_ON_FOLLOWUP_OPENED = "on_followup_opened"
 CONF_ON_AUDIBLE_ERROR = "on_audible_error"
+CONF_ON_ANNOUNCE = "on_announce"
 
 va_client_ns = cg.esphome_ns.namespace("va_client")
 VaClient = va_client_ns.class_("VaClient", cg.Component)
@@ -32,6 +33,9 @@ OnFollowupOpenedTrigger = va_client_ns.class_(
 )
 OnAudibleErrorTrigger = va_client_ns.class_(
     "OnAudibleErrorTrigger", automation.Trigger.template()
+)
+OnAnnounceTrigger = va_client_ns.class_(
+    "OnAnnounceTrigger", automation.Trigger.template(cg.bool_)
 )
 
 CONFIG_SCHEMA = cv.Schema(
@@ -69,6 +73,13 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_ON_AUDIBLE_ERROR): automation.validate_automation(
             {
                 cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(OnAudibleErrorTrigger),
+            }
+        ),
+        # Fired with `playing` true when an announce utterance starts and
+        # false when it ends (add-ons with utterance framing only).
+        cv.Optional(CONF_ON_ANNOUNCE): automation.validate_automation(
+            {
+                cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(OnAnnounceTrigger),
             }
         ),
     }
@@ -112,3 +123,7 @@ async def to_code(config):
     for conf in config.get(CONF_ON_AUDIBLE_ERROR, []):
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)
         await automation.build_automation(trigger, [], conf)
+
+    for conf in config.get(CONF_ON_ANNOUNCE, []):
+        trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)
+        await automation.build_automation(trigger, [(cg.bool_, "playing")], conf)

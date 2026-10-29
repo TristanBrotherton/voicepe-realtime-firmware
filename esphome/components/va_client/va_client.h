@@ -21,6 +21,7 @@ class OnPhaseTrigger;
 class OnRepeatedFailureTrigger;
 class OnFollowupOpenedTrigger;
 class OnAudibleErrorTrigger;
+class OnAnnounceTrigger;
 
 class VaClient : public Component {
  public:
@@ -56,6 +57,7 @@ class VaClient : public Component {
     followup_opened_triggers_.push_back(t);
   }
   void add_on_audible_error_trigger(OnAudibleErrorTrigger *t) { audible_error_triggers_.push_back(t); }
+  void add_on_announce_trigger(OnAnnounceTrigger *t) { announce_triggers_.push_back(t); }
 
   // ---- Wake protocol v2 -----------------------------------------------------
   // The active wake model's identity and operating point, set from yaml
@@ -109,7 +111,19 @@ class VaClient : public Component {
   // Double-press: explicit false-wake flag, any time.
   void send_false_flag();
   bool enroll_active() const { return this->enroll_mode_; }
-  void send_interrupt();
+  // Stops local playback and tells the backend why: "stop", "wake",
+  // "button", "mute" or "residual" ("no_speech" is sent by the watchdog
+  // itself). The message carries a per-connection `seq` and, when the add-on
+  // frames its audio as utterances, the playing utterance and its fed bytes.
+  void send_interrupt(const std::string &reason);
+  // Old yaml packages: an interrupt without a reason.
+  void send_interrupt() { this->send_interrupt(std::string()); }
+  // True while an `announce` utterance (a timer line, an announcement) plays
+  // and for kAnnounceStopHoldMs after it finished. The yaml "stop" handler
+  // acts on a stop in this window even when no reply is in progress, so the
+  // add-on learns the announcement was heard. Only ever true when the add-on
+  // sends utt_start framing.
+  bool announce_stop_window() const;
   // Called from yaml's on_followup_opened automation AFTER the chime has
   // finished announcing through the speaker (wait_until !is_announcing +
   // i2s tail). Opens the mic for kRequestFollowUpMs. No-op if the device
@@ -166,8 +180,16 @@ class VaClient : public Component {
   // independently of a server-sent phase).
   void fire_phase_led_(const std::string &phase);
   void open_followup_window_(uint32_t duration_ms);
-  // Send a JSON text frame if connected (returns false otherwise).
-  bool send_text_(const std::string &msg, uint32_t timeout_ms);
+  // Queue a JSON text frame for the text sender task if connected (returns
+  // false when not connected or the queue is full).
+  bool send_text_(const std::string &msg);
+  bool enqueue_text_(const char *data, size_t len);
+  // The interrupt message alone (reason, seq, utt/fed); no local cleanup.
+  // In utt mode it also starts discarding until the matching interrupt_ack.
+  void send_interrupt_msg_(const char *reason, bool have_utt, uint32_t utt, uint32_t fed);
+  // Under ring_mux_: the utterance an interrupt refers to (the playing one,
+  // else the latest finished one). False if none.
+  bool utt_interrupt_target_locked_(uint32_t &id, uint32_t &fed);
   // Per-turn timing summary for the backend timeline; always sent once per
   // reply/turn end (it used to be logged only on the deferred-idle path).
   void emit_turn_metrics_(const char *reason);
@@ -209,6 +231,7 @@ class VaClient : public Component {
   std::vector<OnRepeatedFailureTrigger *> repeated_failure_triggers_;
   std::vector<OnFollowupOpenedTrigger *> followup_opened_triggers_;
   std::vector<OnAudibleErrorTrigger *> audible_error_triggers_;
+  std::vector<OnAnnounceTrigger *> announce_triggers_;
 
   // ---- Wake protocol v2 state ------------------------------------------------
   // Turn ids are "<boot id>-<counter>": unique across reboots without a clock.
@@ -289,6 +312,122 @@ class VaClient : public Component {
   std::atomic<uint32_t> mic_tx_dropped_{0};
   static void mic_tx_task_fn_(void *arg);
   void mic_tx_loop_();
+
+  // Text -> WebSocket hand-off. Every text frame (start, wake, interrupt,
+  // flush, turn_metrics, utt_ack, button and flag messages, trigger audio)
+  // goes through this one FIFO and its sender task, for the same reason as
+  // the mic: a text send with a 100-200 ms timeout aborted the connection on
+  // a short TCP stall (the client treats a timed-out write as a network
+  // error), and portMAX_DELAY sends could block the main loop or the WS task.
+  // One FIFO also keeps the order: an interrupt is never sent behind a later
+  // ack. Each item is a 4-byte connection generation plus the frame; items
+  // queued for an earlier connection are dropped, never sent on a new one.
+  static constexpr size_t kTextTxBytes = 24 * 1024;
+  static constexpr uint32_t kTextTxSendTimeoutMs = 1500;  // >= 1 s: ride out a stall
+  RingbufHandle_t text_tx_rb_{nullptr};
+  TaskHandle_t text_tx_task_{nullptr};
+  std::atomic<uint32_t> conn_gen_{0};
+  std::atomic<uint32_t> text_tx_dropped_{0};
+  std::atomic<bool> text_tx_sending_{false};  // the sender holds a received item
+  // millis() of the last failed WebSocket write (either sender); 0 = none.
+  // A disconnect right after one is reported as why "tx_timeout".
+  std::atomic<uint32_t> last_tx_fail_ms_{0};
+  static void text_tx_task_fn_(void *arg);
+  void text_tx_loop_();
+
+  // Why the previous connection ended, reported once in the next `start`
+  // ("last_disconnect"). After a boot: why "reboot" with the reset reason.
+  const char *disc_why_{"reboot"};
+  int disc_esp_err_{0};
+  int disc_errno_{0};
+  int disc_reset_reason_{-1};
+  uint32_t disc_up_s_{0};
+  bool disc_up_known_{false};
+  uint32_t disc_at_ms_{0};
+  bool disc_pending_{true};
+  uint32_t connected_at_ms_{0};
+  std::string build_start_msg_();
+
+  // ---- Utterance framing (utt1) ----------------------------------------------
+  // An add-on that owns the speaker frames its audio as utterances:
+  // utt_start{id,kind,turn}, binary PCM, utt_end{id,bytes}. The device keeps a
+  // descriptor per utterance over the playback ring (stream offsets: bytes
+  // written / bytes accepted by the speaker chain since boot) and acks them
+  // (utt_ack: playing, progress, done, cut, dropped). Everything here is
+  // inert until the first utt_start of a connection: without it the device
+  // behaves exactly as before (prebuffer, prime once per turn, suppression
+  // until `listening`, stretch-based echo guard).
+  enum class UttKind : uint8_t { OTHER = 0, CLIP, ACK, REPLY, RESULT, PROMPT, ANNOUNCE, COACH };
+  enum class UttState : uint8_t { QUEUED = 0, PLAYING, DONE, CUT, DROPPED };
+  struct Utt {
+    uint32_t id{0};
+    UttKind kind{UttKind::OTHER};
+    UttState st{UttState::QUEUED};
+    uint64_t start_off{0};   // ring_in_total_ at utt_start
+    uint64_t end_off{0};     // valid once ended
+    bool ended{false};
+    uint32_t declared{0};    // bytes from utt_end
+    uint32_t first_rx_ms{0};
+    uint32_t last_progress_ms{0};
+    uint32_t und{0};
+    bool start_checked{false};
+    bool cold{false};
+    bool orphan{false};      // from an earlier connection: tracked, never acked
+  };
+  struct UttEvent {
+    uint32_t id;
+    UttState st;  // PLAYING with progress=true means "progress"
+    bool progress;
+    bool announce;
+    uint32_t fed;
+    uint32_t wait_ms;
+    uint32_t und;
+  };
+  static constexpr size_t kMaxUtts = 16;
+  Utt utts_[kMaxUtts];
+  size_t utt_first_{0};   // index of the oldest descriptor
+  size_t utt_count_{0};
+  int open_utt_{-1};      // descriptor receiving binary frames (WS task), -1 none
+  uint64_t ring_in_total_{0};
+  uint64_t ring_out_total_{0};
+  std::atomic<bool> utt_mode_{false};
+  std::atomic<bool> utt_discarding_{false};
+  std::atomic<uint32_t> utt_discard_seq_{0};
+  uint32_t utt_discard_since_ms_{0};
+  static constexpr uint32_t kUttDiscardMaxMs = 10000;  // safety net if an ack is lost
+  uint32_t interrupt_seq_{0};
+  // Latest finished utterance (for interrupt utt/fed and prev_utt).
+  bool last_utt_valid_{false};
+  uint32_t last_utt_id_{0};
+  uint32_t last_utt_fed_{0};
+  uint32_t last_utt_bytes_{0};
+  UttState last_utt_st_{UttState::DONE};
+  bool last_utt_reported_{true};
+  std::string prev_utt_json_;
+  bool utt_dry_{false};
+  // Announcement stop window (see announce_stop_window()).
+  bool announce_playing_{false};
+  uint32_t announce_end_ms_{0};
+  static constexpr uint32_t kAnnounceStopHoldMs = 10000;
+  // Start rule from hello (utt mode only; legacy keeps kChainPrimeMs).
+  uint32_t chain_prime_ms_{kChainPrimeMs};
+  uint32_t utt_cushion_ms_{0};
+  static constexpr uint32_t kChainPrimeMaxMs = 600;
+  static constexpr uint32_t kUttCushionMaxMs = 1000;
+  static constexpr uint32_t kUttStartDeadlineMs = 300;
+  Utt *utt_at_(size_t i) { return &this->utts_[(this->utt_first_ + i) % kMaxUtts]; }
+  static UttKind utt_kind_from_(const std::string &k);
+  static const char *utt_state_name_(UttState st);
+  void handle_utt_text_(const std::string &msg, bool is_start);
+  // Per-utterance start rule; true = this tick fed prime silence or holds.
+  bool utt_start_gate_(uint32_t now_ms);
+  // Feeds pending prime silence; true while priming (hold real audio).
+  bool feed_prime_(uint32_t now_ms);
+  // State transitions, acks, progress ticks, underrun counting.
+  void utt_service_(uint32_t now_ms, bool chain_dry);
+  void send_utt_events_(const UttEvent *ev, size_t n);
+  // Under ring_mux_: mark every unfinished descriptor cut/dropped.
+  size_t utt_flush_locked_(UttEvent *ev, size_t cap);
 
   // Mic pre-roll ring (int16 mono @ kMicSampleRate), allocated in PSRAM. The
   // rolling ring continuously retains the most recent kPreRollMs of mic audio
@@ -436,7 +575,7 @@ class VaClient : public Component {
   // often not heard at all and longer ones lost their first word; 200 ms of
   // silence first fixed both on a Voice PE for about 90 ms more latency
   // before the first word (400 ms also fixed it, for about 410 ms).
-  static constexpr uint32_t kChainPrimeMs = 200;  // silence lead at a cold reply start
+  static constexpr uint32_t kChainPrimeMs = 200;  // silence lead at a cold reply start (legacy; utt default)
   static constexpr uint32_t kChainColdMs = 600;   // backup timer; is_stopped() is the primary signal
   // Bytes of silence still to feed this cold-start (24kHz mono 16-bit). >0 while
   // priming; loop() feeds silence and holds real-audio drain until it reaches 0.
