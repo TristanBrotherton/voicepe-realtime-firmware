@@ -1,6 +1,7 @@
 // Host check for esphome/components/va_client/ws_rx.h (no ESP-IDF needed):
-//   c++ -std=c++17 -Wall -Wextra -Werror -I esphome/components/va_client \
+//   c++ -std=c++17 -Wall -Wextra -Werror -I esphome/components/va_client
 //       tools/ci/test_ws_rx.cpp -o build/test_ws_rx && build/test_ws_rx
+// (as the Realtime firmware workflow runs it)
 //
 // esp_websocket_client delivers a frame in as many pieces as TCP reads
 // return. These cases split frames at every position and check that text is
