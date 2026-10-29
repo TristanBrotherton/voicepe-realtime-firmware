@@ -38,5 +38,14 @@ class OnAudibleErrorTrigger : public Trigger<> {
   explicit OnAudibleErrorTrigger(VaClient *parent) { parent->add_on_audible_error_trigger(this); }
 };
 
+// Fires with true when an `announce` utterance (timer line, announcement)
+// starts playing and with false when it has finished, been cut or dropped.
+// Only with an add-on that frames its audio as utterances (utt1). yaml arms
+// the "stop" word for it, so a stop acknowledges the announcement.
+class OnAnnounceTrigger : public Trigger<bool> {
+ public:
+  explicit OnAnnounceTrigger(VaClient *parent) { parent->add_on_announce_trigger(this); }
+};
+
 }  // namespace va_client
 }  // namespace esphome

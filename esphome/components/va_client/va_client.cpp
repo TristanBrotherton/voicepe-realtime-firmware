@@ -4,6 +4,7 @@
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
 #include "esphome/components/audio/audio.h"
+#include "esphome/components/network/util.h"
 
 #include <algorithm>
 #include <cstring>
@@ -11,6 +12,7 @@
 #include <esp_websocket_client.h>
 #include <esp_event.h>
 #include <esp_heap_caps.h>
+#include <esp_system.h>
 #include <mbedtls/base64.h>
 
 namespace esphome {
@@ -85,6 +87,16 @@ void VaClient::setup() {
       xTaskCreate(&VaClient::mic_tx_task_fn_, "va_mic_tx", 4096, this, 5, &this->mic_tx_task_) != pdPASS) {
     ESP_LOGE(TAG, "Failed to start the mic sender; mic frames will be sent from the mic task");
   }
+  // Text -> WebSocket hand-off (see kTextTxBytes): one FIFO for every text
+  // frame and its sender task.
+  this->text_tx_rb_ = xRingbufferCreateWithCaps(kTextTxBytes, RINGBUF_TYPE_NOSPLIT,
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (this->text_tx_rb_ == nullptr ||
+      xTaskCreate(&VaClient::text_tx_task_fn_, "va_text_tx", 4096, this, 5, &this->text_tx_task_) != pdPASS) {
+    this->text_tx_task_ = nullptr;
+    ESP_LOGE(TAG, "Failed to start the text sender; text frames will be sent directly");
+  }
+  this->disc_reset_reason_ = static_cast<int>(esp_reset_reason());
 
   if (this->mic_ != nullptr) {
     this->mic_->add_data_callback(
@@ -141,6 +153,15 @@ void VaClient::setup() {
 }
 
 void VaClient::loop() {
+  // Utterance framing: state transitions, acks and progress ticks. Inert
+  // (no descriptors) unless the add-on sends utt_start.
+  if (this->speaker_ != nullptr && this->audio_buf_ != nullptr && this->utt_count_ > 0)
+    this->utt_service_(millis(), !this->speaker_->has_buffered_data());
+  if (this->utt_discarding_.load() && millis() - this->utt_discard_since_ms_ > kUttDiscardMaxMs) {
+    this->utt_discarding_ = false;
+    ESP_LOGW(TAG, "no interrupt_ack for seq %u after %u ms: accepting audio again",
+             (unsigned) this->utt_discard_seq_.load(), (unsigned) kUttDiscardMaxMs);
+  }
   // Drain the audio ring buffer into the speaker. speaker.play() accepts
   // only what fits in its own ring (returns the count actually queued).
   if (this->speaker_ != nullptr && this->audio_buf_ != nullptr) {
@@ -151,7 +172,13 @@ void VaClient::loop() {
     size_t tail = this->audio_tail_;
     size_t fill = this->audio_fill_;
     portEXIT_CRITICAL(&this->ring_mux_);
-    if (fill > 0) {
+    if (fill > 0 && this->utt_mode_.load()) {
+      // Utterance framing: the per-utterance start rule (cold prime from
+      // hello, optional cushion, nothing back to back) replaces the
+      // once-per-turn prime and the prebuffer below.
+      if (this->utt_start_gate_(millis()))
+        return;
+    } else if (fill > 0) {
       // Resampler cold-start SILENCE-PRIME (crackle fix). The resampler does NOT
       // idle-timeout (verified vs ESPHome source): resample(stop_gracefully=false)
       // never returns FINISHED, and its output mixer-source is timeout:never, so the
@@ -184,18 +211,10 @@ void VaClient::loop() {
           ESP_LOGD(TAG, "resampler cold — priming %u bytes of silence before reply",
                    (unsigned) this->chain_prime_remaining_);
         }
-        if (this->chain_prime_remaining_ > 0) {
-          static const uint8_t kSilence[480] = {0};  // 10ms @24k mono16; fed in chunks
-          size_t want = std::min(this->chain_prime_remaining_, sizeof(kSilence));
-          size_t fed = this->speaker_->play(kSilence, want);
-          if (fed > 0) {
-            this->chain_prime_remaining_ -= fed;
-            this->last_fed_ms_ = now_ms;  // count silence as "fed" so cold-check clears
-          }
-          // Hold real-audio drain until the chain is warmed. Real audio stays in
-          // PSRAM. Re-enter loop() next tick to continue/finish priming.
+        // Hold real-audio drain until the chain is warmed. Real audio stays in
+        // PSRAM. Re-enter loop() next tick to continue/finish priming.
+        if (this->feed_prime_(now_ms))
           return;
-        }
       }
       // Jitter buffer priming gate. After the ring was empty (reply start or a
       // post-underflow gap) hold playback until either the prebuffer cushion has
@@ -214,6 +233,8 @@ void VaClient::loop() {
           return;  // keep accumulating; don't drain (and don't false-flag underrun)
         }
       }
+    }
+    if (fill > 0) {
       // Detector 3: downstream underrun. If the resampler/mixer/i2s chain
       // ran out of bytes to play while we *still* have PSRAM queued,
       // something hiccupped downstream — the user hears silence or a
@@ -241,7 +262,11 @@ void VaClient::loop() {
       size_t accepted = this->speaker_->play(this->audio_buf_ + head, contiguous);
       if (accepted > 0) {
         this->last_fed_ms_ = millis();  // keep the chain "warm" for cold-detection
-        if (this->last_reply_fed_ms_ == 0 || this->last_fed_ms_ - this->last_reply_fed_ms_ >= kAudioStretchGapMs)
+        // Echo-guard anchor. Utterance framing anchors it at each utterance's
+        // first fed byte (utt_service_); without it, a stretch starts after a
+        // feeding pause of kAudioStretchGapMs.
+        if (!this->utt_mode_.load() &&
+            (this->last_reply_fed_ms_ == 0 || this->last_fed_ms_ - this->last_reply_fed_ms_ >= kAudioStretchGapMs))
           this->audible_stretch_start_ms_ = this->last_fed_ms_;
         this->last_reply_fed_ms_ = this->last_fed_ms_;
         this->reply_audio_started_this_turn_ = true;
@@ -255,6 +280,7 @@ void VaClient::loop() {
         portENTER_CRITICAL(&this->ring_mux_);
         this->audio_head_ = (this->audio_head_ + accepted) % kAudioBufBytes;
         this->audio_fill_ -= accepted;
+        this->ring_out_total_ += accepted;
         portEXIT_CRITICAL(&this->ring_mux_);
         static uint32_t dbg_last = 0;
         uint32_t now = millis();
@@ -457,6 +483,56 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
   switch (event_id) {
     case WEBSOCKET_EVENT_CONNECTED: {
       ESP_LOGI(TAG, "WS connected");
+      // New connection generation first: text frames still queued for the
+      // previous connection are dropped by the sender, never sent on this one.
+      this->conn_gen_.fetch_add(1);
+      this->connected_at_ms_ = millis();
+      // Utterance framing is per connection. Descriptors still playing from
+      // the previous connection keep playing but are never acked; the last
+      // one without a `done` is reported as prev_utt.
+      this->utt_mode_ = false;
+      this->utt_discarding_ = false;
+      this->interrupt_seq_ = 0;
+      {
+        bool have = false;
+        uint32_t id = 0, fed = 0, bytes = 0;
+        UttState st = UttState::DONE;
+        portENTER_CRITICAL(&this->ring_mux_);
+        for (size_t i = this->utt_count_; i > 0; i--) {
+          Utt *u = this->utt_at_(i - 1);
+          if (u->orphan)
+            continue;
+          if (u->st == UttState::QUEUED || u->st == UttState::PLAYING) {
+            const uint64_t avail = u->ended ? u->end_off : this->ring_in_total_;
+            const uint64_t out = std::min(this->ring_out_total_, avail);
+            have = true;
+            id = u->id;
+            fed = out > u->start_off ? static_cast<uint32_t>(out - u->start_off) : 0;
+            bytes = u->ended ? u->declared : static_cast<uint32_t>(avail - u->start_off);
+            st = u->st;
+          }
+          break;  // only the newest utterance of the previous connection counts
+        }
+        if (!have && this->last_utt_valid_ && !this->last_utt_reported_) {
+          have = true;
+          id = this->last_utt_id_;
+          fed = this->last_utt_fed_;
+          bytes = this->last_utt_bytes_;
+          st = this->last_utt_st_;
+        }
+        for (size_t i = 0; i < this->utt_count_; i++)
+          this->utt_at_(i)->orphan = true;
+        this->open_utt_ = -1;
+        this->last_utt_valid_ = false;
+        this->last_utt_reported_ = true;
+        portEXIT_CRITICAL(&this->ring_mux_);
+        this->prev_utt_json_.clear();
+        if (have) {
+          this->prev_utt_json_ = "{\"id\":" + std::to_string(id) + ",\"fed\":" + std::to_string(fed) +
+                                 ",\"bytes\":" + std::to_string(bytes) + ",\"st\":\"" + utt_state_name_(st) +
+                                 "\"}";
+        }
+      }
       this->ws_connected_ = true;
       this->reconnect_delay_ms_ = 1000;  // reset backoff on a clean open
       // Don't reset the failure counter / fired flag yet — a flap-and-die
@@ -471,9 +547,11 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
         }
       });
 
-      const char start_msg[] = "{\"type\":\"start\"}";
-      auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-      esp_websocket_client_send_text(handle, start_msg, sizeof(start_msg) - 1, portMAX_DELAY);
+      // Every connection starts with `start`: capabilities, firmware, why the
+      // previous connection ended and the utterance it left unfinished.
+      const std::string start_msg = this->build_start_msg_();
+      this->send_text_(start_msg);
+      ESP_LOGI(TAG, "sent %s", start_msg.c_str());
       this->set_phase_("idle");
       this->defer([this]() { this->flush_queued_flags_(); });
       break;
@@ -507,7 +585,33 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
     case WEBSOCKET_EVENT_CLOSED:
     case WEBSOCKET_EVENT_ERROR: {
       if (this->ws_connected_) {
-        ESP_LOGW(TAG, "WS disconnected (event %d)", (int) event_id);
+        // Record why this live connection ended, for the next `start`.
+        const uint32_t now = millis();
+        const uint32_t tx_fail = this->last_tx_fail_ms_.load();
+        int err_type = 0;
+        this->disc_esp_err_ = 0;
+        this->disc_errno_ = 0;
+        if (data != nullptr) {
+          err_type = static_cast<int>(data->error_handle.error_type);
+          this->disc_esp_err_ = static_cast<int>(data->error_handle.esp_tls_last_esp_err);
+          this->disc_errno_ = data->error_handle.esp_transport_sock_errno;
+        }
+        if (tx_fail != 0 && now - tx_fail < 3000) {
+          this->disc_why_ = "tx_timeout";
+        } else if (!network::is_connected()) {
+          this->disc_why_ = "wifi";
+        } else if (event_id == WEBSOCKET_EVENT_CLOSED || err_type == WEBSOCKET_ERROR_TYPE_SERVER_CLOSE) {
+          this->disc_why_ = "ws_closed";
+        } else {
+          this->disc_why_ = "ws_error";
+        }
+        this->disc_up_s_ = (now - this->connected_at_ms_) / 1000;
+        this->disc_up_known_ = true;
+        this->disc_at_ms_ = now;
+        this->disc_pending_ = true;
+        ESP_LOGW(TAG, "WS disconnected (event %d, %s, error type %d, esp_err %d, errno %d, up %u s)",
+                 (int) event_id, this->disc_why_, err_type, this->disc_esp_err_, this->disc_errno_,
+                 (unsigned) this->disc_up_s_);
       }
       this->ws_connected_ = false;
       // A dropped WS mid-enrollment must not leave the mic pinned open with
@@ -598,6 +702,41 @@ void VaClient::handle_text_(const char *data, size_t len) {
       ESP_LOGI(TAG, "hello: playback prebuffer (jitter buffer) = %u ms (%s)", (unsigned) v,
                v == 0 ? "disabled" : "cushion before playback");
     }
+    // Per-utterance start rule (used only with utterance framing; legacy
+    // playback keeps kChainPrimeMs and the prebuffer above).
+    if (parse_uint_after_key(msg, "\"chain_prime_ms\":", v)) {
+      this->chain_prime_ms_ = std::min(v, kChainPrimeMaxMs);
+      ESP_LOGI(TAG, "hello: utterance cold prime = %u ms", (unsigned) this->chain_prime_ms_);
+    }
+    if (parse_uint_after_key(msg, "\"utt_cushion_ms\":", v)) {
+      this->utt_cushion_ms_ = std::min(v, kUttCushionMaxMs);
+      ESP_LOGI(TAG, "hello: utterance start cushion = %u ms", (unsigned) this->utt_cushion_ms_);
+    }
+    return;
+  }
+
+  // Utterance framing (utt1). These never carry a "value" key, so they can't
+  // reach the phase parser below.
+  if (msg.find("\"type\":\"utt_start\"") != std::string::npos) {
+    this->handle_utt_text_(msg, true);
+    return;
+  }
+  if (msg.find("\"type\":\"utt_end\"") != std::string::npos) {
+    this->handle_utt_text_(msg, false);
+    return;
+  }
+  if (msg.find("\"type\":\"interrupt_ack\"") != std::string::npos) {
+    uint32_t seq = 0;
+    if (!parse_uint_after_key(msg, "\"seq\":", seq)) {
+      ESP_LOGW(TAG, "interrupt_ack without seq ignored");
+      return;
+    }
+    if (this->utt_discarding_.load() && seq >= this->utt_discard_seq_.load()) {
+      this->utt_discarding_ = false;
+      ESP_LOGI(TAG, "interrupt_ack %u: accepting utterances again", (unsigned) seq);
+    } else {
+      ESP_LOGD(TAG, "interrupt_ack %u (nothing to release)", (unsigned) seq);
+    }
     return;
   }
 
@@ -686,8 +825,15 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
   // rest of the already-generated reply. Drop it so the cancelled reply goes
   // silent instead of refilling the PSRAM ring we just flushed. Cleared on the
   // next "idle"/"listening" phase (see set_phase_).
-  if (this->suppress_incoming_audio_)
+  // Utterance framing: everything between a device interrupt and its
+  // interrupt_ack is dropped (the interrupt epoch). Legacy: drop until the
+  // next `listening` phase.
+  if (this->utt_mode_.load()) {
+    if (this->utt_discarding_.load())
+      return;
+  } else if (this->suppress_incoming_audio_) {
     return;
+  }
   const uint32_t now_ms = millis();
   if (this->turn_t_first_audio_out_ == 0 && this->turn_t_wake_ != 0) {
     this->turn_t_first_audio_out_ = now_ms;
@@ -763,6 +909,13 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
   // to guarantee that ordering — len is at most a few KB per WS frame
   // and PSRAM memcpy is ~10–20 µs, well under any audio deadline.
   portENTER_CRITICAL(&this->ring_mux_);
+  if (this->utt_discarding_.load()) {
+    // An interrupt landed while this frame was being scaled: drop it.
+    portEXIT_CRITICAL(&this->ring_mux_);
+    return;
+  }
+  if (this->open_utt_ >= 0 && this->utts_[this->open_utt_].first_rx_ms == 0)
+    this->utts_[this->open_utt_].first_rx_ms = now_ms;
   const bool was_empty = (this->audio_fill_ == 0);
   size_t tail = this->audio_tail_;
   size_t first = std::min(len, kAudioBufBytes - tail);
@@ -772,6 +925,7 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
   }
   this->audio_tail_ = (tail + len) % kAudioBufBytes;
   this->audio_fill_ += len;
+  this->ring_in_total_ += len;
   portEXIT_CRITICAL(&this->ring_mux_);
   // Jitter buffer: arm priming only when the ring was empty AND the downstream
   // chain is dry — i.e. a true reply start or a real underflow. Mid-reply the
@@ -780,7 +934,7 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
   // nothing but spam "prebuffer ready" every ~50 ms and could hold a small
   // trailing chunk for the full prebuffer deadline. has_buffered_data() is a
   // counter read, safe enough from the WS task. Only when enabled.
-  if (was_empty && !this->reply_audio_started_this_turn_ &&
+  if (was_empty && !this->utt_mode_.load() && !this->reply_audio_started_this_turn_ &&
       this->playback_prebuffer_ms_ > 0 && !this->playback_priming_ &&
       !this->speaker_->has_buffered_data()) {
     this->prime_started_ms_ = now_ms;
@@ -888,6 +1042,7 @@ void VaClient::mic_tx_loop_() {
                                                      pdMS_TO_TICKS(kMicTxSendTimeoutMs));
       const uint32_t took = millis() - t0;
       if (sent < 0) {
+        this->last_tx_fail_ms_ = millis();
         ESP_LOGW(TAG, "mic send failed after %u ms (%u bytes)", (unsigned) took, (unsigned) len);
       } else if (took > 50) {
         ESP_LOGD(TAG, "mic send stalled %u ms (rode it out)", (unsigned) took);
@@ -1011,11 +1166,16 @@ void VaClient::set_phase_(const std::string &phase) {
     // now-cancelled sentence. We do NOT send a WS interrupt here — the backend
     // initiated this — we just stop local playback.
     if (this->barge_in_ && this->audio_fill_ > 0) {
+      UttEvent ev[kMaxUtts];
+      size_t n = 0;
       portENTER_CRITICAL(&this->ring_mux_);
+      n = this->utt_flush_locked_(ev, kMaxUtts);
       this->audio_head_ = 0;
       this->audio_tail_ = 0;
       this->audio_fill_ = 0;
+      this->ring_out_total_ = this->ring_in_total_;
       portEXIT_CRITICAL(&this->ring_mux_);
+      this->send_utt_events_(ev, n);
       this->idle_emit_pending_ = false;
       ESP_LOGI(TAG, "phase=listening during reply — barge-in, flushed TTS queue");
     }
@@ -1217,7 +1377,7 @@ void VaClient::start_session() {
   if (residual_reply) {
     ESP_LOGI(TAG, "start_session: interrupting residual reply (phase=%s, fill=%u)",
              phase_name_(phase_now), (unsigned) this->audio_fill_);
-    this->send_interrupt();
+    this->send_interrupt("residual");
   }
 
   // Discard (do NOT replay) the pre-roll captured before this session. The ring
@@ -1286,9 +1446,11 @@ void VaClient::start_session() {
              (unsigned) kNoSpeechTimeoutMs);
     this->emit_turn_metrics_("no_speech");
     if (this->ws_connected_ && this->ws_handle_ != nullptr) {
-      const char m[] = "{\"type\":\"interrupt\"}";
-      auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-      esp_websocket_client_send_text(handle, m, sizeof(m) - 1, portMAX_DELAY);
+      uint32_t utt = 0, fed = 0;
+      portENTER_CRITICAL(&this->ring_mux_);
+      const bool have_utt = this->utt_mode_.load() && this->utt_interrupt_target_locked_(utt, fed);
+      portEXIT_CRITICAL(&this->ring_mux_);
+      this->send_interrupt_msg_("no_speech", have_utt, utt, fed);
     }
     this->streaming_ = false;
     this->turn_t_wake_ = 0;
@@ -1416,25 +1578,72 @@ void VaClient::enroll_stop(bool notify_backend) {
   // Don't let the routine idle transition open a follow-up mic window — the
   // session is over, the device should go fully to rest.
   this->suppress_followup_ = true;
-  if (notify_backend && this->ws_connected_ && this->ws_handle_ != nullptr) {
-    const char m[] = "{\"type\":\"enroll_stopped\"}";
-    auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-    esp_websocket_client_send_text(handle, m, sizeof(m) - 1, 100 / portTICK_PERIOD_MS);
-  }
+  if (notify_backend)
+    this->send_text_("{\"type\":\"enroll_stopped\"}");
   this->set_phase_("idle");
 }
 
-bool VaClient::send_text_(const std::string &msg, uint32_t timeout_ms) {
+bool VaClient::send_text_(const std::string &msg) { return this->enqueue_text_(msg.data(), msg.size()); }
+
+bool VaClient::enqueue_text_(const char *data, size_t len) {
   if (!this->ws_connected_ || this->ws_handle_ == nullptr)
     return false;
-  auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-  return esp_websocket_client_send_text(handle, msg.c_str(), static_cast<int>(msg.size()),
-                                        timeout_ms / portTICK_PERIOD_MS) >= 0;
+  if (this->text_tx_task_ == nullptr) {
+    // Fallback without the sender task: a direct send, still with a timeout
+    // long enough to ride out a TCP stall.
+    auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
+    const bool ok = esp_websocket_client_send_text(handle, data, static_cast<int>(len),
+                                                   pdMS_TO_TICKS(kTextTxSendTimeoutMs)) >= 0;
+    if (!ok)
+      this->last_tx_fail_ms_ = millis();
+    return ok;
+  }
+  void *item = nullptr;
+  if (xRingbufferSendAcquire(this->text_tx_rb_, &item, len + sizeof(uint32_t), 0) != pdTRUE || item == nullptr) {
+    this->text_tx_dropped_.fetch_add(1);
+    ESP_LOGW(TAG, "text sender queue full: dropped a %u-byte frame", (unsigned) len);
+    return false;
+  }
+  const uint32_t gen = this->conn_gen_.load();
+  std::memcpy(item, &gen, sizeof(gen));
+  std::memcpy(static_cast<uint8_t *>(item) + sizeof(gen), data, len);
+  xRingbufferSendComplete(this->text_tx_rb_, item);
+  return true;
+}
+
+void VaClient::text_tx_task_fn_(void *arg) { static_cast<VaClient *>(arg)->text_tx_loop_(); }
+
+void VaClient::text_tx_loop_() {
+  for (;;) {
+    size_t len = 0;
+    void *item = xRingbufferReceive(this->text_tx_rb_, &len, pdMS_TO_TICKS(500));
+    if (item == nullptr)
+      continue;
+    uint32_t gen = 0;
+    if (len >= sizeof(gen))
+      std::memcpy(&gen, item, sizeof(gen));
+    auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
+    if (len > sizeof(gen) && gen == this->conn_gen_.load() && this->ws_connected_ && handle != nullptr) {
+      const uint32_t t0 = millis();
+      const int sent = esp_websocket_client_send_text(handle, static_cast<const char *>(item) + sizeof(gen),
+                                                      static_cast<int>(len - sizeof(gen)),
+                                                      pdMS_TO_TICKS(kTextTxSendTimeoutMs));
+      const uint32_t took = millis() - t0;
+      if (sent < 0) {
+        this->last_tx_fail_ms_ = millis();
+        ESP_LOGW(TAG, "text send failed after %u ms (%u bytes)", (unsigned) took, (unsigned) (len - sizeof(gen)));
+      } else if (took > 100) {
+        ESP_LOGD(TAG, "text send stalled %u ms (rode it out)", (unsigned) took);
+      }
+    }
+    // Stale (earlier connection) or not connected: dropped.
+    vRingbufferReturnItem(this->text_tx_rb_, item);
+  }
 }
 
 void VaClient::send_button_cancel() {
   std::string m = "{\"type\":\"button_cancel\",\"turn\":\"" + json_safe(this->turn_id_) + "\"}";
-  if (this->send_text_(m, 100))
+  if (this->send_text_(m))
     ESP_LOGI(TAG, "button cancel sent");
 }
 
@@ -1442,7 +1651,7 @@ void VaClient::send_false_flag() {
   // Names the turn it flags, so the backend labels exactly that wake on this
   // device. Pressed while offline: queued and sent with its age on reconnect.
   std::string m = "{\"type\":\"false_flag\",\"turn\":\"" + json_safe(this->turn_id_) + "\"}";
-  if (this->send_text_(m, 100)) {
+  if (this->send_text_(m)) {
     ESP_LOGI(TAG, "explicit false-wake flag sent (double-press, turn %s)", this->turn_id_.c_str());
     return;
   }
@@ -1457,7 +1666,7 @@ void VaClient::flush_queued_flags_() {
     const auto &flag = this->queued_flags_.front();
     std::string m = "{\"type\":\"false_flag\",\"turn\":\"" + json_safe(flag.first) +
                     "\",\"age_ms\":" + std::to_string(millis() - flag.second) + "}";
-    if (!this->send_text_(m, 200))
+    if (!this->send_text_(m))
       return;
     ESP_LOGI(TAG, "queued false-wake flag delivered (turn %s)", flag.first.c_str());
     this->queued_flags_.erase(this->queued_flags_.begin());
@@ -1481,7 +1690,7 @@ void VaClient::note_wake_fired(bool from_button) {
 
 void VaClient::send_shadow_detection(const std::string &model) {
   std::string m = "{\"type\":\"shadow_detection\",\"model\":\"" + json_safe(model) + "\"}";
-  if (this->send_text_(m, 100))
+  if (this->send_text_(m))
     ESP_LOGI(TAG, "shadow model detection reported (%s)", model.c_str());
 }
 
@@ -1498,7 +1707,6 @@ void VaClient::send_trigger_chunks_() {
     this->snapshot_send_pending_ = false;  // skip the clip; never crash for it
     return;
   }
-  auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
   // Two chunks per loop pass keeps the main loop responsive.
   for (int i = 0; i < 2 && this->snapshot_send_pending_; i++) {
     const size_t remaining = this->snapshot_samples_ - this->snapshot_sent_samples_;
@@ -1519,8 +1727,17 @@ void VaClient::send_trigger_chunks_() {
     size_t len = head + b64_len;
     buf[len++] = '"';
     buf[len++] = '}';
-    if (!this->ws_connected_ ||
-        esp_websocket_client_send_text(handle, buf, static_cast<int>(len), 200 / portTICK_PERIOD_MS) < 0) {
+    if (!this->ws_connected_) {
+      ESP_LOGW(TAG, "trigger snippet not sent (chunk %u)", (unsigned) (this->snapshot_sent_samples_ / kTriggerChunkSamples));
+      this->snapshot_send_pending_ = false;
+      return;
+    }
+    // Through the text sender. A full queue is back-pressure: retry this
+    // chunk on a later loop pass (the sender drains at link speed).
+    if (this->text_tx_rb_ != nullptr && this->text_tx_task_ != nullptr &&
+        xRingbufferGetCurFreeSize(this->text_tx_rb_) < len + 16)
+      return;
+    if (!this->enqueue_text_(buf, len)) {
       ESP_LOGW(TAG, "trigger snippet not sent (chunk %u)", (unsigned) (this->snapshot_sent_samples_ / kTriggerChunkSamples));
       this->snapshot_send_pending_ = false;
       return;
@@ -1583,7 +1800,7 @@ void VaClient::emit_turn_metrics_(const char *reason) {
   if (std::strcmp(reason, "reply") == 0 && !this->output_batch_id_.empty())
     m += ",\"output_batch_id\":\"" + json_safe(this->output_batch_id_) + "\"";
   m += "}";
-  this->send_text_(m, 100);
+  this->send_text_(m);
   this->output_batch_id_.clear();
 }
 
@@ -1596,12 +1813,8 @@ void VaClient::send_mic_flush_() {
   // the server VAD and caused garbage commits). This timer only fires when the
   // user did NOT trigger speech — `listening` cancels va_followup — so it can
   // never drop a valid command. Cheap no-op when the buffer was empty.
-  if (this->ws_connected_ && this->ws_handle_ != nullptr) {
-    const char msg[] = "{\"type\":\"flush\"}";
-    auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-    esp_websocket_client_send_text(handle, msg, sizeof(msg) - 1, portMAX_DELAY);
+  if (this->send_text_("{\"type\":\"flush\"}"))
     ESP_LOGI(TAG, "follow-up window closed — sent flush (drop uncommitted mic audio)");
-  }
 }
 
 void VaClient::send_wake_() {
@@ -1628,8 +1841,7 @@ void VaClient::send_wake_() {
     if (!this->firmware_version_.empty())
       msg += ",\"fw\":\"" + json_safe(this->firmware_version_) + "\"";
     msg += "}";
-    auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-    esp_websocket_client_send_text(handle, msg.c_str(), static_cast<int>(msg.size()), portMAX_DELAY);
+    this->send_text_(msg);
     ESP_LOGI(TAG, "wake — sent %s", msg.c_str());
     if (this->snapshot_requested_ || this->snapshot_ready_)
       this->snapshot_wake_turn_ = this->turn_id_;  // sent by loop() when ready
@@ -1690,20 +1902,18 @@ void VaClient::commit_followup_mic() {
   });
 }
 
-void VaClient::send_interrupt() {
+void VaClient::send_interrupt(const std::string &reason) {
   if (this->reply_t_anchor_ != 0 && !this->turn_metrics_sent_ && this->reply_t_first_audio_ != 0)
     this->emit_turn_metrics_("interrupted");
-  // Best-effort cancel to the backend — ONLY if the socket is alive. The local
-  // cleanup below must ALWAYS run: returning early on a dead socket (the old
-  // behaviour) left streaming_ on, the PSRAM ring full and the follow-up timers
-  // armed after a "stop" on a dead link, so the mic would resume streaming the
-  // room the instant we reconnected.
-  if (this->ws_connected_ && this->ws_handle_ != nullptr) {
-    const char msg[] = "{\"type\":\"interrupt\"}";
-    auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-    esp_websocket_client_send_text(handle, msg, sizeof(msg) - 1, portMAX_DELAY);
-  } else {
-    ESP_LOGW(TAG, "send_interrupt: WS not connected — local cleanup only");
+  const bool connected = this->ws_connected_ && this->ws_handle_ != nullptr;
+  const bool utt = this->utt_mode_.load();
+  // Utterance framing: from here until the add-on's interrupt_ack, every
+  // utt_* and binary frame is dropped (set before the flush so a frame being
+  // written right now can't land in the flushed ring).
+  if (utt && connected) {
+    this->utt_discard_seq_ = this->interrupt_seq_ + 1;
+    this->utt_discard_since_ms_ = millis();
+    this->utt_discarding_ = true;
   }
   // Flush our PSRAM playback queue — what's already been pushed into the
   // resampler/mixer/leaf will still drain (~600 ms residual), but everything
@@ -1713,14 +1923,35 @@ void VaClient::send_interrupt() {
   // happen under the mux: the WS task could be mid-write and seeing
   // head=tail=fill=0 partway through would let it write into a "freshly
   // empty" buffer the user just barge-cancelled.
+  UttEvent ev[kMaxUtts];
+  size_t n = 0;
+  uint32_t target_id = 0, target_fed = 0;
   portENTER_CRITICAL(&this->ring_mux_);
+  const bool have_target = utt && this->utt_interrupt_target_locked_(target_id, target_fed);
+  n = this->utt_flush_locked_(ev, kMaxUtts);
   this->audio_head_ = 0;
   this->audio_tail_ = 0;
   this->audio_fill_ = 0;
+  this->ring_out_total_ = this->ring_in_total_;
   portEXIT_CRITICAL(&this->ring_mux_);
-  // Drop further incoming TTS until the backend confirms the turn boundary —
-  // it keeps streaming the rest of the (already-generated) reply otherwise.
-  this->suppress_incoming_audio_ = true;
+  // Best-effort cancel to the backend — ONLY if the socket is alive. The local
+  // cleanup must ALWAYS run: returning early on a dead socket (the old
+  // behaviour) left streaming_ on, the PSRAM ring full and the follow-up timers
+  // armed after a "stop" on a dead link, so the mic would resume streaming the
+  // room the instant we reconnected. The interrupt goes out before the acks
+  // for the utterances it cut (one FIFO keeps that order).
+  if (connected) {
+    this->send_interrupt_msg_(reason.c_str(), have_target, target_id, target_fed);
+  } else {
+    ESP_LOGW(TAG, "send_interrupt: WS not connected — local cleanup only");
+  }
+  this->send_utt_events_(ev, n);
+  // Legacy: drop further incoming TTS until the backend confirms the turn
+  // boundary (`listening`) — it keeps streaming the rest of the
+  // (already-generated) reply otherwise. Utterance framing uses the
+  // interrupt_ack epoch instead.
+  if (!utt)
+    this->suppress_incoming_audio_ = true;
   // Ring was just flushed; re-arm the jitter buffer fresh for the next reply.
   this->playback_priming_ = false;
   // Abandon any in-progress cold-start silence-prime; the next reply will detect
@@ -1749,7 +1980,403 @@ void VaClient::send_interrupt() {
   // Cleared in start_session() (the next wake). See set_phase_.
   this->post_stop_guard_ = true;
   this->cancel_timeout("va_followup_open");
-  ESP_LOGI(TAG, "send_interrupt — WS msg sent, queue flushed");
+  ESP_LOGI(TAG, "send_interrupt (%s) — WS msg sent, queue flushed", reason.empty() ? "no reason" : reason.c_str());
+}
+
+// ---- Start message and interrupts ---------------------------------------------
+
+std::string VaClient::build_start_msg_() {
+  std::string m = "{\"type\":\"start\",\"caps\":[\"ireason1\",\"utt1\"]";
+  if (!this->firmware_version_.empty())
+    m += ",\"fw\":\"" + json_safe(this->firmware_version_) + "\"";
+  if (this->disc_pending_) {
+    this->disc_pending_ = false;
+    m += ",\"last_disconnect\":{\"why\":\"";
+    m += this->disc_why_;
+    m += "\"";
+    if (!this->disc_up_known_) {
+      // First connection after a boot: the reset reason (esp_reset_reason_t).
+      m += ",\"reset\":" + std::to_string(this->disc_reset_reason_);
+    } else {
+      m += ",\"esp_err\":" + std::to_string(this->disc_esp_err_);
+      m += ",\"errno\":" + std::to_string(this->disc_errno_);
+      m += ",\"up_s\":" + std::to_string(this->disc_up_s_);
+    }
+    m += ",\"ago_s\":" + std::to_string((millis() - this->disc_at_ms_) / 1000) + "}";
+  }
+  if (!this->prev_utt_json_.empty()) {
+    m += ",\"prev_utt\":" + this->prev_utt_json_;
+    this->prev_utt_json_.clear();
+  }
+  m += "}";
+  return m;
+}
+
+void VaClient::send_interrupt_msg_(const char *reason, bool have_utt, uint32_t utt, uint32_t fed) {
+  if (!this->ws_connected_ || this->ws_handle_ == nullptr)
+    return;
+  const uint32_t seq = ++this->interrupt_seq_;
+  std::string m = "{\"type\":\"interrupt\"";
+  if (reason != nullptr && reason[0] != '\0')
+    m += ",\"reason\":\"" + json_safe(reason) + "\"";
+  m += ",\"seq\":" + std::to_string(seq);
+  if (have_utt)
+    m += ",\"utt\":" + std::to_string(utt) + ",\"fed\":" + std::to_string(fed);
+  m += "}";
+  if (this->utt_mode_.load()) {
+    // Drop utt_* and binary frames until the add-on acks this interrupt.
+    this->utt_discard_seq_ = seq;
+    this->utt_discard_since_ms_ = millis();
+    this->utt_discarding_ = true;
+  }
+  this->send_text_(m);
+  ESP_LOGI(TAG, "interrupt sent: %s", m.c_str());
+}
+
+bool VaClient::announce_stop_window() const {
+  if (this->announce_playing_)
+    return true;
+  return this->announce_end_ms_ != 0 && millis() - this->announce_end_ms_ < kAnnounceStopHoldMs;
+}
+
+// ---- Utterance framing ----------------------------------------------------------
+
+VaClient::UttKind VaClient::utt_kind_from_(const std::string &k) {
+  if (k == "clip")
+    return UttKind::CLIP;
+  if (k == "ack")
+    return UttKind::ACK;
+  if (k == "reply")
+    return UttKind::REPLY;
+  if (k == "result")
+    return UttKind::RESULT;
+  if (k == "prompt")
+    return UttKind::PROMPT;
+  if (k == "announce")
+    return UttKind::ANNOUNCE;
+  if (k == "coach")
+    return UttKind::COACH;
+  return UttKind::OTHER;
+}
+
+const char *VaClient::utt_state_name_(UttState st) {
+  switch (st) {
+    case UttState::QUEUED:
+      return "queued";
+    case UttState::PLAYING:
+      return "playing";
+    case UttState::DONE:
+      return "done";
+    case UttState::CUT:
+      return "cut";
+    default:
+      return "dropped";
+  }
+}
+
+void VaClient::handle_utt_text_(const std::string &msg, bool is_start) {
+  uint32_t id = 0;
+  if (!parse_uint_after_key(msg, "\"id\":", id)) {
+    ESP_LOGW(TAG, "%s without id ignored", is_start ? "utt_start" : "utt_end");
+    return;
+  }
+  if (this->utt_discarding_.load()) {
+    ESP_LOGD(TAG, "%s %u discarded (awaiting interrupt_ack)", is_start ? "utt_start" : "utt_end", (unsigned) id);
+    return;
+  }
+  if (is_start) {
+    std::string kind;
+    parse_string_after_key(msg, "\"kind\":\"", kind);
+    const UttKind k = utt_kind_from_(kind);
+    bool tracked = false;
+    bool implicit_end = false;
+    portENTER_CRITICAL(&this->ring_mux_);
+    if (this->open_utt_ >= 0) {
+      Utt &o = this->utts_[this->open_utt_];
+      if (!o.ended) {
+        o.ended = true;
+        o.end_off = this->ring_in_total_;
+        o.declared = static_cast<uint32_t>(o.end_off - o.start_off);
+        implicit_end = true;
+      }
+      this->open_utt_ = -1;
+    }
+    while (this->utt_count_ > 0) {
+      const UttState st = this->utt_at_(0)->st;
+      if (st != UttState::DONE && st != UttState::CUT && st != UttState::DROPPED)
+        break;
+      this->utt_first_ = (this->utt_first_ + 1) % kMaxUtts;
+      this->utt_count_--;
+    }
+    if (this->utt_count_ < kMaxUtts) {
+      const size_t idx = (this->utt_first_ + this->utt_count_) % kMaxUtts;
+      this->utts_[idx] = Utt{};
+      this->utts_[idx].id = id;
+      this->utts_[idx].kind = k;
+      this->utts_[idx].start_off = this->ring_in_total_;
+      this->open_utt_ = static_cast<int>(idx);
+      this->utt_count_++;
+      tracked = true;
+    }
+    portEXIT_CRITICAL(&this->ring_mux_);
+    if (!this->utt_mode_.exchange(true))
+      ESP_LOGI(TAG, "utterance framing on for this connection");
+    if (implicit_end)
+      ESP_LOGW(TAG, "utt_start %u before the previous utt_end: previous closed", (unsigned) id);
+    if (tracked) {
+      ESP_LOGD(TAG, "utt %u start (%s)", (unsigned) id, kind.c_str());
+    } else {
+      ESP_LOGW(TAG, "utt %u not tracked: %u utterances queued", (unsigned) id, (unsigned) kMaxUtts);
+    }
+    return;
+  }
+  uint32_t bytes = 0;
+  parse_uint_after_key(msg, "\"bytes\":", bytes);
+  bool found = false;
+  uint32_t received = 0;
+  portENTER_CRITICAL(&this->ring_mux_);
+  if (this->open_utt_ >= 0 && this->utts_[this->open_utt_].id == id) {
+    Utt &u = this->utts_[this->open_utt_];
+    u.ended = true;
+    u.end_off = this->ring_in_total_;
+    u.declared = bytes;
+    received = static_cast<uint32_t>(u.end_off - u.start_off);
+    this->open_utt_ = -1;
+    found = true;
+  }
+  portEXIT_CRITICAL(&this->ring_mux_);
+  if (!found) {
+    ESP_LOGW(TAG, "utt_end %u does not match the open utterance; ignored", (unsigned) id);
+  } else if (received != bytes) {
+    ESP_LOGW(TAG, "utt %u end: %u bytes received, %u announced", (unsigned) id, (unsigned) received,
+             (unsigned) bytes);
+  } else {
+    ESP_LOGD(TAG, "utt %u end (%u bytes)", (unsigned) id, (unsigned) bytes);
+  }
+}
+
+bool VaClient::feed_prime_(uint32_t now_ms) {
+  if (this->chain_prime_remaining_ == 0)
+    return false;
+  static const uint8_t kSilence[480] = {0};  // 10ms @24k mono16; fed in chunks
+  size_t want = std::min(this->chain_prime_remaining_, sizeof(kSilence));
+  size_t fed = this->speaker_->play(kSilence, want);
+  if (fed > 0) {
+    this->chain_prime_remaining_ -= fed;
+    this->last_fed_ms_ = now_ms;  // count silence as "fed" so cold-check clears
+  }
+  return true;
+}
+
+bool VaClient::utt_start_gate_(uint32_t now_ms) {
+  // Prime silence still going out: hold real audio.
+  if (this->feed_prime_(now_ms))
+    return true;
+  // Cold = the resampler was stopped (speaker.stop) or nothing was fed for
+  // kChainColdMs. Checked once per utterance, at its first byte: a
+  // back-to-back utterance finds the chain still fed and gets no prime.
+  const bool chain_cold = this->speaker_->is_stopped() || this->last_fed_ms_ == 0 ||
+                          (now_ms - this->last_fed_ms_) > kChainColdMs;
+  bool start_prime = false;
+  bool hold = false;
+  uint32_t id = 0;
+  portENTER_CRITICAL(&this->ring_mux_);
+  for (size_t i = 0; i < this->utt_count_; i++) {
+    Utt *u = this->utt_at_(i);
+    if (u->st != UttState::QUEUED)
+      continue;
+    // Only the first queued utterance can be at the play head.
+    if (u->start_off == this->ring_out_total_) {
+      if (!u->start_checked) {
+        u->start_checked = true;
+        u->cold = chain_cold;
+        start_prime = chain_cold && this->chain_prime_ms_ > 0;
+        id = u->id;
+      }
+      if (!start_prime && u->cold && this->utt_cushion_ms_ > 0) {
+        // Optional start cushion (hello utt_cushion_ms, default 0): start
+        // once that much is buffered, or the utterance is complete, or
+        // kUttStartDeadlineMs after its first byte.
+        const uint64_t avail = u->ended ? u->end_off : this->ring_in_total_;
+        const uint64_t want = (uint64_t) this->utt_cushion_ms_ * (kPlaybackSampleRate / 1000) * 2;
+        const bool deadline = u->first_rx_ms != 0 && now_ms - u->first_rx_ms >= kUttStartDeadlineMs;
+        if (avail - u->start_off < want && !u->ended && !deadline)
+          hold = true;
+      }
+    }
+    break;
+  }
+  portEXIT_CRITICAL(&this->ring_mux_);
+  if (start_prime) {
+    this->chain_prime_remaining_ = (size_t) this->chain_prime_ms_ * (kPlaybackSampleRate / 1000) * 2;
+    ESP_LOGD(TAG, "utt %u: cold chain — priming %u ms of silence", (unsigned) id,
+             (unsigned) this->chain_prime_ms_);
+    this->feed_prime_(now_ms);
+    return true;
+  }
+  return hold;
+}
+
+void VaClient::utt_service_(uint32_t now_ms, bool chain_dry) {
+  UttEvent ev[kMaxUtts * 2];
+  size_t n = 0;
+  bool anchor = false;
+  int announce_change = -1;  // -1 none, 1 started, 0 ended
+  portENTER_CRITICAL(&this->ring_mux_);
+  const uint64_t out = this->ring_out_total_;
+  bool any_playing = false;
+  for (size_t i = 0; i < this->utt_count_; i++) {
+    Utt *u = this->utt_at_(i);
+    const bool announce = u->kind == UttKind::ANNOUNCE;
+    if (u->st == UttState::QUEUED) {
+      const bool empty = u->ended && u->end_off == u->start_off;
+      if (!(out > u->start_off || (empty && out >= u->start_off)))
+        break;  // not started; later ones can't have either
+      u->st = UttState::PLAYING;
+      u->last_progress_ms = now_ms;
+      if (!empty)
+        anchor = true;
+      if (announce) {
+        this->announce_playing_ = true;
+        announce_change = 1;
+      }
+      if (!u->orphan && n < kMaxUtts * 2) {
+        const uint32_t wait = u->first_rx_ms != 0 ? now_ms - u->first_rx_ms : 0;
+        ev[n++] = UttEvent{u->id, UttState::PLAYING, false, announce, 0, wait, 0};
+      }
+    }
+    if (u->st == UttState::PLAYING) {
+      const uint64_t avail = u->ended ? u->end_off : this->ring_in_total_;
+      const uint32_t fed = static_cast<uint32_t>(std::min(out, avail) - u->start_off);
+      if (u->ended && out >= u->end_off) {
+        u->st = UttState::DONE;
+        if (announce) {
+          this->announce_playing_ = false;
+          this->announce_end_ms_ = now_ms;
+          announce_change = 0;
+        }
+        if (!u->orphan) {
+          if (n < kMaxUtts * 2)
+            ev[n++] = UttEvent{u->id, UttState::DONE, false, announce, fed, 0, u->und};
+          this->last_utt_valid_ = true;
+          this->last_utt_id_ = u->id;
+          this->last_utt_fed_ = fed;
+          this->last_utt_bytes_ = u->declared;
+          this->last_utt_st_ = UttState::DONE;
+          this->last_utt_reported_ = true;
+        }
+      } else {
+        // Underruns: the chain ran dry while this utterance still had bytes
+        // to come (counted once per dry interval).
+        if (!any_playing) {
+          if (chain_dry && !this->utt_dry_)
+            u->und++;
+        }
+        any_playing = true;
+        if (now_ms - u->last_progress_ms >= 1000) {
+          u->last_progress_ms = now_ms;
+          if (!u->orphan && n < kMaxUtts * 2)
+            ev[n++] = UttEvent{u->id, UttState::PLAYING, true, announce, fed, 0, 0};
+        }
+      }
+    }
+  }
+  this->utt_dry_ = any_playing && chain_dry;
+  // Finished descriptors at the front are no longer needed (their events
+  // were collected when they finished).
+  while (this->utt_count_ > 0) {
+    const UttState st = this->utt_at_(0)->st;
+    if (st != UttState::DONE && st != UttState::CUT && st != UttState::DROPPED)
+      break;
+    this->utt_first_ = (this->utt_first_ + 1) % kMaxUtts;
+    this->utt_count_--;
+  }
+  portEXIT_CRITICAL(&this->ring_mux_);
+  if (anchor) {
+    // Echo guard anchored at this utterance's first fed byte.
+    this->audible_stretch_start_ms_ = now_ms;
+    this->last_reply_fed_ms_ = now_ms;
+  }
+  this->send_utt_events_(ev, n);
+  if (announce_change >= 0) {
+    const bool playing = announce_change == 1;
+    ESP_LOGI(TAG, "announcement %s", playing ? "playing: stop armed" : "finished");
+    this->defer([this, playing]() {
+      for (auto *t : this->announce_triggers_)
+        t->trigger(playing);
+    });
+  }
+}
+
+bool VaClient::utt_interrupt_target_locked_(uint32_t &id, uint32_t &fed) {
+  for (size_t i = 0; i < this->utt_count_; i++) {
+    Utt *u = this->utt_at_(i);
+    if (u->orphan || u->st != UttState::PLAYING)
+      continue;
+    const uint64_t avail = u->ended ? u->end_off : this->ring_in_total_;
+    id = u->id;
+    fed = static_cast<uint32_t>(std::min(this->ring_out_total_, avail) - u->start_off);
+    return true;
+  }
+  if (this->last_utt_valid_) {
+    id = this->last_utt_id_;
+    fed = this->last_utt_fed_;
+    return true;
+  }
+  return false;
+}
+
+size_t VaClient::utt_flush_locked_(UttEvent *ev, size_t cap) {
+  size_t n = 0;
+  const uint64_t out = this->ring_out_total_;
+  for (size_t i = 0; i < this->utt_count_; i++) {
+    Utt *u = this->utt_at_(i);
+    if (u->st != UttState::QUEUED && u->st != UttState::PLAYING)
+      continue;
+    const bool started = u->st == UttState::PLAYING;
+    const uint64_t avail = u->ended ? u->end_off : this->ring_in_total_;
+    const uint32_t fed = started ? static_cast<uint32_t>(std::min(out, avail) - u->start_off) : 0;
+    u->st = started ? UttState::CUT : UttState::DROPPED;
+    if (u->kind == UttKind::ANNOUNCE && this->announce_playing_) {
+      this->announce_playing_ = false;
+      this->announce_end_ms_ = 0;
+    }
+    if (!u->orphan) {
+      if (n < cap)
+        ev[n++] = UttEvent{u->id, u->st, false, u->kind == UttKind::ANNOUNCE, fed, 0, u->und};
+      this->last_utt_valid_ = true;
+      this->last_utt_id_ = u->id;
+      this->last_utt_fed_ = fed;
+      this->last_utt_bytes_ = u->ended ? u->declared : static_cast<uint32_t>(avail - u->start_off);
+      this->last_utt_st_ = u->st;
+      this->last_utt_reported_ = false;
+    }
+  }
+  this->open_utt_ = -1;
+  this->utt_dry_ = false;
+  return n;
+}
+
+void VaClient::send_utt_events_(const UttEvent *ev, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    const UttEvent &e = ev[i];
+    const char *st = e.progress ? "progress" : utt_state_name_(e.st);
+    std::string m = "{\"type\":\"utt_ack\",\"id\":" + std::to_string(e.id) + ",\"st\":\"" + st + "\"";
+    if (e.st == UttState::PLAYING && !e.progress) {
+      m += ",\"fed\":0,\"wait_ms\":" + std::to_string(e.wait_ms);
+    } else {
+      m += ",\"fed\":" + std::to_string(e.fed);
+    }
+    if (e.st == UttState::DONE || e.st == UttState::CUT)
+      m += ",\"und\":" + std::to_string(e.und);
+    m += "}";
+    this->send_text_(m);
+    if (e.progress) {
+      ESP_LOGV(TAG, "%s", m.c_str());
+    } else {
+      ESP_LOGD(TAG, "%s", m.c_str());
+    }
+  }
 }
 
 }  // namespace va_client

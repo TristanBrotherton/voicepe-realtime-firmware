@@ -442,7 +442,7 @@ switch:
               return id(voice_assistant_phase) == ${voice_assist_waiting_for_command_phase_id} ||
                      id(voice_assistant_phase) == ${voice_assist_listening_for_command_phase_id};
           then:
-            - lambda: 'id(va)->send_interrupt();'
+            - lambda: 'id(va)->send_interrupt("mute");'
             - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
       - script.execute: control_leds
     on_turn_off:
@@ -582,7 +582,7 @@ binary_sensor:
                                 condition:
                                   lambda: 'return id(voice_assistant_phase) != ${voice_assist_idle_phase_id};'
                                 then:
-                                  - lambda: 'id(va)->send_interrupt();'
+                                  - lambda: 'id(va)->send_interrupt("button");'
                                   # Fast button-silence after a wake = the
                                   # user shutting up a false trigger; tell
                                   # the backend so it can flag the capture.
@@ -658,7 +658,7 @@ binary_sensor:
                 # a radio-triggered session kept chatting for 17s after the
                 # flag until a separate single-press stopped it).
                 - lambda: 'id(va)->send_false_flag();'
-                - lambda: 'id(va)->send_interrupt();'
+                - lambda: 'id(va)->send_interrupt("button");'
                 - speaker.stop:
                     id: media_resampling_speaker
                 - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
@@ -2268,6 +2268,25 @@ va_client:
     # loud announcement — it fired at night and woke the household). The
     # no_ha_connection red twinkle is the sole indicator.
     - script.execute: control_leds
+  on_announce:
+    # An announcement (timer line, announce lane) is an utterance with no
+    # phases, so "stop" is not armed by on_phase. Arm it while the
+    # announcement plays; when it ends, hand the disarm to the same watchdog
+    # as after a reply (only at rest: during a turn the turn owns it). The
+    # stop handler acts on it through announce_stop_window().
+    - if:
+        condition:
+          lambda: 'return playing;'
+        then:
+          - lambda: 'id(stop).set_probability_cutoff(${stop_cutoff_playing});'
+          - micro_wake_word.enable_model: stop
+          - script.stop: followup_window_watchdog
+        else:
+          - if:
+              condition:
+                lambda: 'return id(voice_assistant_phase) == ${voice_assist_idle_phase_id};'
+              then:
+                - script.execute: followup_window_watchdog
   on_audible_error:
     # A turn the USER started failed and the add-on could not explain it out
     # loud: play the error chime (never fires without a user-initiated turn).
@@ -2491,9 +2510,16 @@ micro_wake_word:
                                 format: "ignoring 'stop' — in the first ${stop_min_play_ms} ms of playback (reply echo)"
                                 level: INFO
                           else:
+                            # Also acts while an announcement (a timer line)
+                            # plays and for a few seconds after it: the stop
+                            # tells the add-on it was heard. Only with an
+                            # add-on that frames announcements as utterances.
                             - if:
                                 condition:
-                                  lambda: 'return id(voice_assistant_phase) != ${voice_assist_idle_phase_id} && id(va)->turn_has_reply_audio();'
+                                  lambda: |-
+                                    return (id(voice_assistant_phase) != ${voice_assist_idle_phase_id} &&
+                                            id(va)->turn_has_reply_audio()) ||
+                                           id(va)->announce_stop_window();
                                 then:
                                   # Red only when a reply was actually cut off. A stop
                                   # in the follow-up window after the reply has finished
@@ -2508,7 +2534,7 @@ micro_wake_word:
                                           # audio has drained, so every stop flashed red.
                                           - lambda: 'return id(media_resampling_speaker)->has_buffered_data();'
                                       then:
-                                        - lambda: 'id(va)->send_interrupt();'
+                                        - lambda: 'id(va)->send_interrupt("stop");'
                                         - speaker.stop:
                                             id: media_resampling_speaker
                                         - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
@@ -2517,7 +2543,7 @@ micro_wake_word:
                                         # control_leds shows idle).
                                         - script.execute: stop_feedback_flash
                                       else:
-                                        - lambda: 'id(va)->send_interrupt();'
+                                        - lambda: 'id(va)->send_interrupt("stop");'
                                         - speaker.stop:
                                             id: media_resampling_speaker
                                         - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
@@ -2545,7 +2571,7 @@ micro_wake_word:
                           then:
                             # Interrupt the active reply. Flush the queue +
                             # stop the resampler so audio cuts immediately.
-                            - lambda: 'id(va)->send_interrupt();'
+                            - lambda: 'id(va)->send_interrupt("wake");'
                             - speaker.stop:
                                 id: media_resampling_speaker
                             # Play the same wake chime as fresh-session so the
