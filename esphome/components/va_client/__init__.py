@@ -92,6 +92,13 @@ async def to_code(config):
         name="espressif/esp_websocket_client",
         ref="1.7.0",
     )
+    # Senders write under their own lock, so the websocket task keeps reading
+    # while a write waits out a stall (other components may select this too).
+    esp32.add_idf_sdkconfig_option("CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK", True)
+    # The websocket task takes that lock to answer a server PING. It must wait
+    # longer than the senders' own write timeout (kTxStallMaxMs, 5 s): if it
+    # gives up first, the client ends the connection the senders rode out.
+    esp32.add_idf_sdkconfig_option("CONFIG_ESP_WS_CLIENT_TX_LOCK_TIMEOUT_MS", 7000)
 
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
