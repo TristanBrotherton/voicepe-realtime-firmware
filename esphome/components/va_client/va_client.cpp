@@ -483,6 +483,7 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
   switch (event_id) {
     case WEBSOCKET_EVENT_CONNECTED: {
       ESP_LOGI(TAG, "WS connected");
+      this->disc_codes_open_ = false;
       // New connection generation first: text frames still queued for the
       // previous connection are dropped by the sender, never sent on this one.
       this->conn_gen_.fetch_add(1);
@@ -601,34 +602,47 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
     case WEBSOCKET_EVENT_DISCONNECTED:
     case WEBSOCKET_EVENT_CLOSED:
     case WEBSOCKET_EVENT_ERROR: {
+      // A transport failure arrives as ERROR (its text names the failing
+      // call; its error codes are uninitialised) and then DISCONNECTED (the
+      // codes, valid for a TCP transport error). ws_disc.h.
+      const bool is_error_event = event_id == WEBSOCKET_EVENT_ERROR;
+      const int err_type = data != nullptr ? static_cast<int>(data->error_handle.error_type) : 0;
+      const bool codes_valid =
+          data != nullptr && ws_error_codes_valid(is_error_event, err_type == WEBSOCKET_ERROR_TYPE_TCP_TRANSPORT);
       if (this->ws_connected_) {
         // Record why this live connection ended, for the next `start`.
         const uint32_t now = millis();
         const uint32_t tx_fail = this->last_tx_fail_ms_.load();
-        int err_type = 0;
-        this->disc_esp_err_ = 0;
-        this->disc_errno_ = 0;
-        if (data != nullptr) {
-          err_type = static_cast<int>(data->error_handle.error_type);
-          this->disc_esp_err_ = static_cast<int>(data->error_handle.esp_tls_last_esp_err);
-          this->disc_errno_ = data->error_handle.esp_transport_sock_errno;
-        }
-        if (tx_fail != 0 && now - tx_fail < 3000) {
-          this->disc_why_ = "tx_timeout";
-        } else if (!network::is_connected()) {
-          this->disc_why_ = "wifi";
-        } else if (event_id == WEBSOCKET_EVENT_CLOSED || err_type == WEBSOCKET_ERROR_TYPE_SERVER_CLOSE) {
-          this->disc_why_ = "ws_closed";
-        } else {
-          this->disc_why_ = "ws_error";
-        }
+        this->disc_where_ = WsFailWhere::NONE;
+        if (is_error_event && data != nullptr && data->data_ptr != nullptr && data->data_len > 0)
+          this->disc_where_ = ws_fail_where(data->data_ptr, static_cast<size_t>(data->data_len));
+        this->disc_esp_err_ = codes_valid ? static_cast<int>(data->error_handle.esp_tls_last_esp_err) : 0;
+        this->disc_errno_ = codes_valid ? data->error_handle.esp_transport_sock_errno : 0;
+        // The codes come with the DISCONNECTED that follows this ERROR.
+        this->disc_codes_open_ = is_error_event;
+        this->disc_why_ = ws_disconnect_why(
+            network::is_connected(),
+            event_id == WEBSOCKET_EVENT_CLOSED || err_type == WEBSOCKET_ERROR_TYPE_SERVER_CLOSE, this->disc_where_,
+            tx_fail != 0 && now - tx_fail < 3000);
         this->disc_up_s_ = (now - this->connected_at_ms_) / 1000;
         this->disc_up_known_ = true;
         this->disc_at_ms_ = now;
         this->disc_pending_ = true;
-        ESP_LOGW(TAG, "WS disconnected (event %d, %s, error type %d, esp_err %d, errno %d, up %u s)",
-                 (int) event_id, this->disc_why_, err_type, this->disc_esp_err_, this->disc_errno_,
-                 (unsigned) this->disc_up_s_);
+        if (is_error_event && data != nullptr && data->data_ptr != nullptr && data->data_len > 0) {
+          ESP_LOGW(TAG, "WS failed: %.*s", data->data_len, data->data_ptr);
+        }
+        ESP_LOGW(TAG, "WS disconnected (event %d, %s, where %s, error type %d, up %u s)", (int) event_id,
+                 this->disc_why_, ws_fail_where_name(this->disc_where_) ? ws_fail_where_name(this->disc_where_) : "-",
+                 err_type, (unsigned) this->disc_up_s_);
+      } else if (this->disc_codes_open_ && !is_error_event) {
+        // The DISCONNECTED right after the ERROR that ended the connection.
+        this->disc_codes_open_ = false;
+        if (codes_valid) {
+          this->disc_esp_err_ = static_cast<int>(data->error_handle.esp_tls_last_esp_err);
+          this->disc_errno_ = data->error_handle.esp_transport_sock_errno;
+          if (this->disc_esp_err_ != 0 || this->disc_errno_ != 0)
+            ESP_LOGW(TAG, "WS disconnect codes: esp_err %d, errno %d", this->disc_esp_err_, this->disc_errno_);
+        }
       }
       this->ws_connected_ = false;
       // A dropped WS mid-enrollment must not leave the mic pinned open with
@@ -1073,7 +1087,9 @@ void VaClient::mic_tx_loop_() {
                                                      static_cast<int>(len),
                                                      pdMS_TO_TICKS(kMicTxSendTimeoutMs));
       const uint32_t took = millis() - t0;
-      if (sent < 0) {
+      // 0 is a failure too: after a timed-out write the client aborts the
+      // connection and returns the write's 0.
+      if (sent <= 0) {
         this->last_tx_fail_ms_ = millis();
         ESP_LOGW(TAG, "mic send failed after %u ms (%u bytes)", (unsigned) took, (unsigned) len);
       } else if (took > 50) {
@@ -1662,7 +1678,7 @@ void VaClient::text_tx_loop_() {
                                                       static_cast<int>(len - sizeof(gen)),
                                                       pdMS_TO_TICKS(kTextTxSendTimeoutMs));
       const uint32_t took = millis() - t0;
-      if (sent < 0) {
+      if (sent <= 0) {  // 0: the write timed out and the client aborted (see the mic sender)
         this->last_tx_fail_ms_ = millis();
         ESP_LOGW(TAG, "text send failed after %u ms (%u bytes)", (unsigned) took, (unsigned) (len - sizeof(gen)));
       } else if (took > 100) {
@@ -2032,6 +2048,12 @@ std::string VaClient::build_start_msg_() {
       // First connection after a boot: the reset reason (esp_reset_reason_t).
       m += ",\"reset\":" + std::to_string(this->disc_reset_reason_);
     } else {
+      const char *where = ws_fail_where_name(this->disc_where_);
+      if (where != nullptr) {
+        m += ",\"where\":\"";
+        m += where;
+        m += "\"";
+      }
       m += ",\"esp_err\":" + std::to_string(this->disc_esp_err_);
       m += ",\"errno\":" + std::to_string(this->disc_errno_);
       m += ",\"up_s\":" + std::to_string(this->disc_up_s_);

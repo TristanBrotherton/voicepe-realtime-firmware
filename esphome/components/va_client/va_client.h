@@ -14,6 +14,7 @@
 #include <freertos/ringbuf.h>
 #include <freertos/task.h>
 
+#include "ws_disc.h"
 #include "ws_rx.h"
 
 namespace esphome {
@@ -308,9 +309,15 @@ class VaClient : public Component {
   // 2026-10-16: "transport_poll_write(0)", then "WS disconnected"). The mic
   // callback now only queues frames here (never waits on the network) and a
   // sender task writes them with a timeout long enough to ride out a stall.
+  // 1 s was not: on a weak link (2026-10-29) the socket
+  // stayed unwritable for over a second while the link recovered, and the
+  // write timeout ended a session that would have carried on. Writes now wait
+  // kTxStallMaxMs; mic frames that queue up meanwhile past kMicTxBytes are
+  // dropped (and counted), so the uplink is never more than ~1 s stale.
   static constexpr size_t kMicTxBytes = 32000;           // 1 s of 16 kHz int16 mono
   static constexpr size_t kMicTxMaxChunk = 3200;         // send at most 100 ms per write
-  static constexpr uint32_t kMicTxSendTimeoutMs = 1000;  // a stall this long is a dead link
+  static constexpr uint32_t kTxStallMaxMs = 5000;        // a stall longer than this is a dead link
+  static constexpr uint32_t kMicTxSendTimeoutMs = kTxStallMaxMs;
   RingbufHandle_t mic_tx_rb_{nullptr};
   TaskHandle_t mic_tx_task_{nullptr};
   std::atomic<uint32_t> mic_tx_dropped_{0};
@@ -327,7 +334,7 @@ class VaClient : public Component {
   // ack. Each item is a 4-byte connection generation plus the frame; items
   // queued for an earlier connection are dropped, never sent on a new one.
   static constexpr size_t kTextTxBytes = 24 * 1024;
-  static constexpr uint32_t kTextTxSendTimeoutMs = 1500;  // >= 1 s: ride out a stall
+  static constexpr uint32_t kTextTxSendTimeoutMs = kTxStallMaxMs;  // ride out a stall (see kMicTxSendTimeoutMs)
   RingbufHandle_t text_tx_rb_{nullptr};
   TaskHandle_t text_tx_task_{nullptr};
   std::atomic<uint32_t> conn_gen_{0};
@@ -349,6 +356,10 @@ class VaClient : public Component {
   bool disc_up_known_{false};
   uint32_t disc_at_ms_{0};
   bool disc_pending_{true};
+  // Which call failed (from the client's ERROR text), and whether the
+  // DISCONNECTED that carries the error codes is still to come (ws_disc.h).
+  WsFailWhere disc_where_{WsFailWhere::NONE};
+  bool disc_codes_open_{false};
   uint32_t connected_at_ms_{0};
   std::string build_start_msg_();
 

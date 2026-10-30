@@ -1,4 +1,4 @@
-// Host check for esphome/components/va_client/ws_rx.h (no ESP-IDF needed):
+// Host check for esphome/components/va_client/ws_rx.h and ws_disc.h (no ESP-IDF needed):
 //   c++ -std=c++17 -Wall -Wextra -Werror -I esphome/components/va_client
 //       tools/ci/test_ws_rx.cpp -o build/test_ws_rx && build/test_ws_rx
 // (as the Realtime firmware workflow runs it)
@@ -6,8 +6,12 @@
 // esp_websocket_client delivers a frame in as many pieces as TCP reads
 // return. These cases split frames at every position and check that text is
 // parsed whole and that every PCM byte arrives, in order, as whole samples.
+// The ws_disc cases check what the device reports about a lost connection.
 
+#include "ws_disc.h"
 #include "ws_rx.h"
+
+#include <cstring>
 
 #include <cstdio>
 #include <cstdlib>
@@ -15,7 +19,12 @@
 #include <vector>
 
 using esphome::va_client::PcmAligner;
+using esphome::va_client::WsFailWhere;
 using esphome::va_client::WsTextAssembler;
+using esphome::va_client::ws_disconnect_why;
+using esphome::va_client::ws_error_codes_valid;
+using esphome::va_client::ws_fail_where;
+using esphome::va_client::ws_fail_where_name;
 
 static int failures = 0;
 
@@ -160,7 +169,61 @@ static void pcm_frame_start_discards_a_dangling_byte() {
   CHECK(rx.discarded() == 1, "the dangling byte is counted");
 }
 
+static WsFailWhere where_of(const char *msg) { return ws_fail_where(msg, std::strlen(msg)); }
+
+static void disc_where_from_client_error_text() {
+  // The texts esp_websocket_client 1.7.0 posts with WEBSOCKET_EVENT_ERROR.
+  CHECK(where_of("esp_transport_write() returned 0, transport_error=ESP_OK, tls_error_code=0, tls_flags=0, "
+                 "errno=0") == WsFailWhere::WRITE,
+        "write");
+  CHECK(where_of("esp_transport_read() failed with -1, transport_error=ESP_OK, tls_error_code=0, tls_flags=0, "
+                 "errno=104") == WsFailWhere::READ,
+        "read");
+  CHECK(where_of("esp_transport_poll_read() returned -1, errno=113") == WsFailWhere::POLL, "poll");
+  CHECK(where_of("Error, no PONG received for more than 120 seconds after PING") == WsFailWhere::PONG, "pong");
+  CHECK(where_of("something else") == WsFailWhere::OTHER, "other");
+  CHECK(ws_fail_where(nullptr, 0) == WsFailWhere::NONE, "no text");
+  // Not NUL-terminated: only data_len bytes count.
+  const char cut[] = "esp_transport_write() returned 0";
+  CHECK(ws_fail_where(cut, 9) == WsFailWhere::OTHER, "length respected");
+  CHECK(std::strcmp(ws_fail_where_name(WsFailWhere::WRITE), "write") == 0, "write name");
+  CHECK(ws_fail_where_name(WsFailWhere::NONE) == nullptr, "no name for none");
+}
+
+static void disc_why_values() {
+  // A write that timed out is a tx_timeout even though the client reports it
+  // from inside the send call, before the sender could note its failure.
+  CHECK(std::strcmp(ws_disconnect_why(true, false, WsFailWhere::WRITE, false), "tx_timeout") == 0, "write");
+  CHECK(std::strcmp(ws_disconnect_why(true, false, WsFailWhere::NONE, true), "tx_timeout") == 0, "tx fail");
+  CHECK(std::strcmp(ws_disconnect_why(true, false, WsFailWhere::READ, false), "ws_error") == 0, "read");
+  CHECK(std::strcmp(ws_disconnect_why(true, true, WsFailWhere::NONE, false), "ws_closed") == 0, "closed");
+  CHECK(std::strcmp(ws_disconnect_why(false, false, WsFailWhere::WRITE, true), "wifi") == 0, "wifi first");
+  // Only the values the add-on accepts.
+  const char *allowed[] = {"ws_error", "ws_closed", "wifi", "tx_timeout"};
+  for (int wifi = 0; wifi < 2; wifi++)
+    for (int closed = 0; closed < 2; closed++)
+      for (int w = 0; w <= static_cast<int>(WsFailWhere::OTHER); w++)
+        for (int tx = 0; tx < 2; tx++) {
+          const char *why = ws_disconnect_why(wifi, closed, static_cast<WsFailWhere>(w), tx);
+          bool ok = false;
+          for (const char *a : allowed)
+            ok = ok || std::strcmp(why, a) == 0;
+          CHECK(ok, "unexpected why %s", why);
+        }
+}
+
+static void disc_error_codes_only_from_disconnected() {
+  // The ERROR event's codes are uninitialised stack (a device reported
+  // errno 1008406854); only a TCP transport DISCONNECTED carries them.
+  CHECK(!ws_error_codes_valid(true, true), "never from ERROR");
+  CHECK(!ws_error_codes_valid(false, false), "not without a transport error");
+  CHECK(ws_error_codes_valid(false, true), "DISCONNECTED after a transport error");
+}
+
 int main() {
+  disc_where_from_client_error_text();
+  disc_why_values();
+  disc_error_codes_only_from_disconnected();
   text_split_anywhere();
   text_back_to_back();
   text_missing_piece_and_oversize();
@@ -171,6 +234,6 @@ int main() {
     std::fprintf(stderr, "%d failure(s)\n", failures);
     return EXIT_FAILURE;
   }
-  std::printf("ws_rx: all checks passed\n");
+  std::printf("ws_rx, ws_disc: all checks passed\n");
   return EXIT_SUCCESS;
 }

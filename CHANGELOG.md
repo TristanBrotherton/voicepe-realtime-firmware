@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- A stall of up to 5 s in the uplink no longer drops the connection. The mic
+  and text senders waited 1 s (1.5 s) for the socket to take a write; the
+  ESP-IDF client treats a write that times out as a network error and ends
+  the connection, so on a weak link a second of stall cost the whole turn
+  (red light; a device on a weak link lost two turns in a row). Senders now wait
+  5 s, with their own TX lock (`CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK`) so
+  the WebSocket task keeps reading meanwhile, and that task waits 7 s for the
+  lock to answer a server PING (it used to give up after 2 s and end the
+  connection). Mic frames that queue up during a stall past 1 s are dropped
+  and counted as before.
+- `last_disconnect` reports what actually failed. Its `esp_err` and `errno`
+  were read from the client's ERROR event, which never fills them in (the
+  device reported `errno` 1008406854: the address of a log tag). They now
+  come from the DISCONNECTED event that follows, and are 0 when there are
+  none. A new `where` names the failing call from the ERROR text: `write`,
+  `read`, `poll`, `pong` or `other`. A timed-out write is now reported as
+  `tx_timeout` (it was `ws_error`: the client reports it from inside the
+  send call, before the sender could note its failure), and a send that
+  returned 0 counts as failed.
+
 - WebSocket frames split across TCP reads are put back together before use.
   The ESP-IDF client posts one data event per read, and a read returns
   whatever has arrived, so a frame can come in several pieces of any length.
