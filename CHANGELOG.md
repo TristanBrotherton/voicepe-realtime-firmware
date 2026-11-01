@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- "Stop" after a timer announcement reaches the add-on, so a heard timer does
+  not ring. It is armed while the announcement plays and for 60 s after it (as
+  long as the add-on waits before the bell; it was 10 s, and the model was
+  disarmed after 12 s anyway), and it does not act while someone is asking
+  something. The 2 s echo guard would have covered most of a short line and its
+  end, so an announcement's stretch is guarded for its first second only (the
+  echo scored like a stop there). The stop cutoff stays at the stricter value
+  through the window: a false stop would silence a bell nobody heard. Needs an
+  add-on that frames announcements as utterances.
+- The device wakes itself less on its own playback: while the speaker holds
+  audio, and for `stop_echo_hold_ms` after it, the wake word's cutoff is raised
+  by `wake_cutoff_playing_delta` (26, about 0.10). Saying the wake word over a
+  reply still barges in. The sensitive "stop" cutoff in the quiet follow-up
+  window stays: a "stop" that fires on "thanks" there closes the turn quietly,
+  and raising it would lose real stops, which dip below 0.5 right after playback.
+
 - A stall of up to 5 s in the uplink no longer drops the connection. The mic
   and text senders waited 1 s (1.5 s) for the socket to take a write; the
   ESP-IDF client treats a write that times out as a network error and ends
@@ -71,8 +87,8 @@
     result without a gap.
   - The stop-echo guard is anchored at each utterance's first fed byte.
   - "stop" is armed while an `announce` utterance (a timer line) plays and
-    for 10 s after it, and is sent as `interrupt{reason:"stop"}`, so the
-    add-on knows the announcement was heard. yaml: `on_announce`.
+    after it, and is sent as `interrupt{reason:"stop"}`, so the add-on knows
+    the announcement was heard. yaml: `on_announce`.
   Without `utt_start` from the add-on, playback is unchanged (prebuffer,
   prime once per turn, incoming audio dropped after an interrupt until the
   next `listening`).

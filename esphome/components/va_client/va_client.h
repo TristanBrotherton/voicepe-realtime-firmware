@@ -124,9 +124,10 @@ class VaClient : public Component {
   // True while an `announce` utterance (a timer line, an announcement) plays
   // and for kAnnounceStopHoldMs after it finished. The yaml "stop" handler
   // acts on a stop in this window even when no reply is in progress, so the
-  // add-on learns the announcement was heard. Only ever true when the add-on
-  // sends utt_start framing.
+  // add-on learns the announcement was heard (a heard timer does not ring).
+  // Only ever true when the add-on sends utt_start framing.
   bool announce_stop_window() const;
+  bool announce_playing() const { return this->announce_playing_; }
   // Called from yaml's on_followup_opened automation AFTER the chime has
   // finished announcing through the speaker (wait_until !is_announcing +
   // i2s tail). Opens the mic for kRequestFollowUpMs. No-op if the device
@@ -147,7 +148,9 @@ class VaClient : public Component {
   // reply audio reaching the speaker chain (after the prebuffer and prime; a
   // stretch starts after kAudioStretchGapMs with none fed, so "Done." after
   // the "One moment" clip gets its own), while that audio is still playing or
-  // its tail is (kEchoTailMs).
+  // its tail is (kEchoTailMs). An announcement's stretch is only guarded for
+  // kAnnounceEchoGuardMs: most of a short timer line would otherwise fall
+  // inside min_play_ms, and with it the stop that says the line was heard.
   bool stop_is_reply_echo(uint32_t min_play_ms) const;
 
   // Called from the static esp-idf event handler trampoline.
@@ -428,7 +431,12 @@ class VaClient : public Component {
   // Announcement stop window (see announce_stop_window()).
   bool announce_playing_{false};
   uint32_t announce_end_ms_{0};
-  static constexpr uint32_t kAnnounceStopHoldMs = 10000;
+  // As long as the add-on waits before it rings the timer bell (60 s).
+  static constexpr uint32_t kAnnounceStopHoldMs = 60000;
+  // The echo scored like a stop in the first second of playback (measured on
+  // short replies, 2026-10-28).
+  static constexpr uint32_t kAnnounceEchoGuardMs = 1000;
+  bool stretch_is_announce_{false};  // the current audible stretch is an announcement
   // Start rule from hello (utt mode only; legacy keeps kChainPrimeMs).
   uint32_t chain_prime_ms_{kChainPrimeMs};
   uint32_t utt_cushion_ms_{0};
