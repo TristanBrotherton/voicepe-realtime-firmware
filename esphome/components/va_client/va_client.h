@@ -434,8 +434,10 @@ class VaClient : public Component {
   // As long as the add-on waits before it rings the timer bell (60 s).
   static constexpr uint32_t kAnnounceStopHoldMs = 60000;
   // The echo scored like a stop in the first second of playback (measured on
-  // short replies, 2026-10-28).
-  static constexpr uint32_t kAnnounceEchoGuardMs = 1000;
+  // short replies, 2026-10-28), and at 1.36 s on a timer line (1 of 6 with
+  // nobody speaking, cutoff at its strict value). A real stop after this still
+  // acts, and the window stays open for a minute after the line.
+  static constexpr uint32_t kAnnounceEchoGuardMs = 2000;
   bool stretch_is_announce_{false};  // the current audible stretch is an announcement
   // Start rule from hello (utt mode only; legacy keeps kChainPrimeMs).
   uint32_t chain_prime_ms_{kChainPrimeMs};
