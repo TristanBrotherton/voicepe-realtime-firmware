@@ -64,8 +64,10 @@ jobs:
             [download]: ${url}`
             })
 
+  # R2 and the install page are upstream's hosting. A release here gets its
+  # firmware through upload-to-release only.
   upload-to-r2:
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' && github.repository_owner == 'esphome'
     name: Upload to R2
     needs:
       - build-firmware
@@ -78,7 +80,7 @@ jobs:
     secrets: inherit  # zizmor: ignore[secrets-inherit]
 
   summary:
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' && github.repository_owner == 'esphome'
     name: Generate Summary
     runs-on: ubuntu-latest
     needs:
@@ -106,7 +108,7 @@ jobs:
 
   promote-beta:
     name: Promote to Beta
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' && github.repository_owner == 'esphome'
     uses: esphome/workflows/.github/workflows/promote-r2.yml@025a1e6255610c498ed590403b7e510b69e474df  # 2026.4.1
     needs:
       - upload-to-r2
@@ -119,7 +121,7 @@ jobs:
 
   promote-prod:
     name: Promote to Production
-    if: github.event_name == 'release' && github.event.release.prerelease == false
+    if: github.event_name == 'release' && github.event.release.prerelease == false && github.repository_owner == 'esphome'
     uses: esphome/workflows/.github/workflows/promote-r2.yml@025a1e6255610c498ed590403b7e510b69e474df  # 2026.4.1
     needs:
       - upload-to-r2
