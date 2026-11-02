@@ -21,6 +21,8 @@ concurrency:
 
 jobs:
   build:
+    # The Pages site is upstream's; this repository has none.
+    if: github.repository_owner == 'esphome'
     name: Build
     runs-on: ubuntu-latest
     steps:

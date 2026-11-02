@@ -11,7 +11,7 @@ jobs:
     name: Update latest build version
     runs-on: ubuntu-latest
     environment: production
-    if: ${{ !contains(github.event.release.tag_name, 'beta') && github.event.changes.make_latest && github.event.changes.make_latest.to == 'true' }}
+    if: ${{ github.repository_owner == 'esphome' && !contains(github.event.release.tag_name, 'beta') && github.event.changes.make_latest && github.event.changes.make_latest.to == 'true' }}
     strategy:
       matrix:
         device:
