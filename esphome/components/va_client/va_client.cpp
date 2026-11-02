@@ -845,8 +845,9 @@ bool VaClient::stop_is_reply_echo(uint32_t min_play_ms) const {
   if (this->audible_stretch_start_ms_ == 0)
     return false;
   const uint32_t now = millis();
+  const uint32_t guard = this->stretch_is_announce_ ? std::min(min_play_ms, kAnnounceEchoGuardMs) : min_play_ms;
   return now - this->last_reply_fed_ms_ < kEchoTailMs &&
-         now - this->audible_stretch_start_ms_ < min_play_ms;
+         now - this->audible_stretch_start_ms_ < guard;
 }
 
 void VaClient::handle_binary_(const uint8_t *data, size_t len, bool frame_start) {
@@ -1473,6 +1474,7 @@ void VaClient::start_session() {
   this->turn_t_first_audio_out_ = 0;
   this->last_reply_fed_ms_ = 0;
   this->audible_stretch_start_ms_ = 0;
+  this->stretch_is_announce_ = false;
   this->reply_t_anchor_ = this->turn_t_wake_;
   this->reply_t_listening_ = 0;
   this->reply_t_thinking_ = 0;
@@ -1953,6 +1955,8 @@ void VaClient::commit_followup_mic() {
 }
 
 void VaClient::send_interrupt(const std::string &reason) {
+  // Any interrupt answers the announcement: the stop window is over.
+  this->announce_end_ms_ = 0;
   if (this->reply_t_anchor_ != 0 && !this->turn_metrics_sent_ && this->reply_t_first_audio_ != 0)
     this->emit_turn_metrics_("interrupted");
   const bool connected = this->ws_connected_ && this->ws_handle_ != nullptr;
@@ -2277,6 +2281,7 @@ void VaClient::utt_service_(uint32_t now_ms, bool chain_dry) {
   UttEvent ev[kMaxUtts * 2];
   size_t n = 0;
   bool anchor = false;
+  bool anchor_announce = false;
   int announce_change = -1;  // -1 none, 1 started, 0 ended
   int64_t closed_idle = -1;   // an utterance ended by the safety net below
   portENTER_CRITICAL(&this->ring_mux_);
@@ -2291,8 +2296,10 @@ void VaClient::utt_service_(uint32_t now_ms, bool chain_dry) {
         break;  // not started; later ones can't have either
       u->st = UttState::PLAYING;
       u->last_progress_ms = now_ms;
-      if (!empty)
+      if (!empty) {
         anchor = true;
+        anchor_announce = announce;
+      }
       if (announce) {
         this->announce_playing_ = true;
         announce_change = 1;
@@ -2371,6 +2378,7 @@ void VaClient::utt_service_(uint32_t now_ms, bool chain_dry) {
     // Echo guard anchored at this utterance's first fed byte.
     this->audible_stretch_start_ms_ = now_ms;
     this->last_reply_fed_ms_ = now_ms;
+    this->stretch_is_announce_ = anchor_announce;
   }
   this->send_utt_events_(ev, n);
   if (announce_change >= 0) {

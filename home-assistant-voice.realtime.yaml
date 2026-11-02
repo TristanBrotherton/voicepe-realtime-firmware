@@ -70,6 +70,11 @@ substitutions:
   # the speaker is ignored (the reply's own echo scores like a real stop
   # there): va_client stop_is_reply_echo().
   stop_min_play_ms: "2000"
+  # The wake word's cutoff (uint8) is this much higher while the speaker holds
+  # audio and for stop_echo_hold_ms after it: the device woke itself on its own
+  # playback (0.66-0.69 against a 0.64 cutoff at volume 0.7). A person saying
+  # the wake word over a reply still barges in.
+  wake_cutoff_playing_delta: "26"
   # Optional log-only candidate model (packages/wake-word-shadow.yaml): its
   # wake word name. Detections are reported, never start a session.
   shadow_wake_word: "__no_shadow_model__"
@@ -111,7 +116,7 @@ substitutions:
   # this package for reproducible builds.
   va_client_ref: "main"
   # Firmware version reported to Home Assistant and in the wake message.
-  fw_version: "1.3.1"
+  fw_version: "1.3.2"
 
 esphome:
   name: ${name}
@@ -335,6 +340,20 @@ globals:
   # stop_cutoff interval.
   - id: stop_last_audio_ms
     type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  # Each wake model's cutoff from the sensitivity tier (0 = not applied yet),
+  # for the same interval, which raises it during playback.
+  - id: wake_base_cutoff_custom
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: wake_base_cutoff_jarvis
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: wake_base_cutoff_nabu
+    type: int
     restore_value: no
     initial_value: '0'
   # Global variable tracking the phase of the voice assistant (defined above). Initialized to not_ready
@@ -1432,6 +1451,9 @@ script:
           const int nd = id(wake_nabu).get_default_probability_cutoff();
           const int nabu = pick(nd, std::max(1, nd - 12), std::max(1, nd - 35));
           id(wake_nabu).set_probability_cutoff(nabu);
+          id(wake_base_cutoff_custom) = custom;
+          id(wake_base_cutoff_jarvis) = jarvis;
+          id(wake_base_cutoff_nabu) = nabu;
           // Report what the ACTIVE model really runs.
           std::string model = "${wake_model_name}";
           std::string sha = std::string("${wake_model_sha256}").substr(0, 8);
@@ -1943,9 +1965,29 @@ script:
               return id(voice_assistant_phase) == ${voice_assist_idle_phase_id} ||
                      id(voice_assistant_phase) == ${voice_assist_listening_for_command_phase_id};
           then:
-            - micro_wake_word.disable_model: stop
+            # Stays armed through an announcement's stop window
+            # (announce_stop_disarm disarms it after that).
+            - if:
+                condition:
+                  lambda: 'return !id(va)->announce_stop_window();'
+                then:
+                  - micro_wake_word.disable_model: stop
             - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
             - script.execute: control_leds
+  # An announcement (timer line) ended: "stop" stays armed as long as the add-on
+  # waits before ringing the bell (va_client kAnnounceStopHoldMs), then is
+  # disarmed unless something else needs it by then.
+  - id: announce_stop_disarm
+    mode: restart
+    then:
+      - delay: 60500ms
+      - if:
+          condition:
+            lambda: |-
+              return !id(va)->announce_stop_window() && !id(timer_ringing).state &&
+                     id(voice_assistant_phase) == ${voice_assist_idle_phase_id};
+          then:
+            - micro_wake_word.disable_model: stop
 
 # (Removed: stock's `activate_stop_word_once` script — orphaned in this fork.
 # "stop" arming is owned by va_client's on_phase + followup_window_watchdog.)
@@ -2270,23 +2312,19 @@ va_client:
     - script.execute: control_leds
   on_announce:
     # An announcement (timer line, announce lane) is an utterance with no
-    # phases, so "stop" is not armed by on_phase. Arm it while the
-    # announcement plays; when it ends, hand the disarm to the same watchdog
-    # as after a reply (only at rest: during a turn the turn owns it). The
-    # stop handler acts on it through announce_stop_window().
+    # phases, so "stop" is not armed by on_phase. Arm it while the announcement
+    # plays and for as long as the add-on waits before ringing the bell after
+    # it: that is when "stop" says the announcement was heard. The stop handler
+    # acts on it through announce_stop_window().
     - if:
         condition:
           lambda: 'return playing;'
         then:
           - lambda: 'id(stop).set_probability_cutoff(${stop_cutoff_playing});'
           - micro_wake_word.enable_model: stop
-          - script.stop: followup_window_watchdog
+          - script.stop: announce_stop_disarm
         else:
-          - if:
-              condition:
-                lambda: 'return id(voice_assistant_phase) == ${voice_assist_idle_phase_id};'
-              then:
-                - script.execute: followup_window_watchdog
+          - script.execute: announce_stop_disarm
   on_audible_error:
     # A turn the USER started failed and the add-on could not explain it out
     # loud: play the error chime (never fires without a user-initiated turn).
@@ -2341,7 +2379,10 @@ va_client:
 
 # The one owner of the "stop" cutoff: strict while the speaker holds reply,
 # clip, chime or timer audio and for stop_echo_hold_ms after it drains, the
-# sensitive quiet value only after that.
+# sensitive quiet value only after that. Also strict through an announcement's
+# stop window: a false stop there would silence a timer bell nobody heard
+# (a missed real stop only means the bell rings, and "stop" ends that).
+# Same interval, same test: the wake word's cutoff is raised during playback.
 interval:
   - interval: 100ms
     then:
@@ -2356,11 +2397,19 @@ interval:
             id(stop_last_audio_ms) = now;
           }
           const bool echo = id(stop_last_audio_ms) != 0 && now - id(stop_last_audio_ms) < ${stop_echo_hold_ms};
-          const int want = echo ? ${stop_cutoff_playing} : ${stop_cutoff_quiet};
+          const bool strict = echo || id(va)->announce_stop_window();
+          const int want = strict ? ${stop_cutoff_playing} : ${stop_cutoff_quiet};
           id(stop).set_probability_cutoff(want);
           if (want != logged) {
             logged = want;
-            ESP_LOGD("stop_cutoff", "stop cutoff %d (%s)", want, echo ? "audio playing" : "quiet");
+            ESP_LOGD("stop_cutoff", "stop cutoff %d (%s)", want, strict ? "audio playing" : "quiet");
+          }
+          if (id(wake_base_cutoff_custom) > 0) {
+            // The raised value stays reachable (0.95 at most).
+            const int raise = echo ? ${wake_cutoff_playing_delta} : 0;
+            id(alexa).set_probability_cutoff(std::min(242, id(wake_base_cutoff_custom) + raise));
+            id(wake_jarvis).set_probability_cutoff(std::min(242, id(wake_base_cutoff_jarvis) + raise));
+            id(wake_nabu).set_probability_cutoff(std::min(242, id(wake_base_cutoff_nabu) + raise));
           }
 
 audio_dac:
@@ -2511,15 +2560,19 @@ micro_wake_word:
                                 level: INFO
                           else:
                             # Also acts while an announcement (a timer line)
-                            # plays and for a few seconds after it: the stop
-                            # tells the add-on it was heard. Only with an
-                            # add-on that frames announcements as utterances.
+                            # plays and, at rest, for a minute after it: the
+                            # stop tells the add-on it was heard. Not while
+                            # someone is asking something: that is a misfire on
+                            # their own speech. Only with an add-on that frames
+                            # announcements as utterances.
                             - if:
                                 condition:
                                   lambda: |-
                                     return (id(voice_assistant_phase) != ${voice_assist_idle_phase_id} &&
                                             id(va)->turn_has_reply_audio()) ||
-                                           id(va)->announce_stop_window();
+                                           id(va)->announce_playing() ||
+                                           (id(voice_assistant_phase) == ${voice_assist_idle_phase_id} &&
+                                            id(va)->announce_stop_window());
                                 then:
                                   # Red only when a reply was actually cut off. A stop
                                   # in the follow-up window after the reply has finished
