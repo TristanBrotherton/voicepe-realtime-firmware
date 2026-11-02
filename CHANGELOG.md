@@ -1,14 +1,14 @@
 # Changelog
 
-## Unreleased
+## 1.3.2
 
 - "Stop" after a timer announcement reaches the add-on, so a heard timer does
   not ring. It is armed while the announcement plays and for 60 s after it (as
   long as the add-on waits before the bell; it was 10 s, and the model was
   disarmed after 12 s anyway), and it does not act while someone is asking
-  something. The 2 s echo guard would have covered most of a short line and its
-  end, so an announcement's stretch is guarded for its first second only (the
-  echo scored like a stop there). The stop cutoff stays at the stricter value
+  something. The 2 s echo guard stays for the start of an announcement, because
+  the line's own echo fired "stop" at 1.36 s in a trial with a 1 s guard, but it
+  doesn't cover the line's end. The stop cutoff stays at the stricter value
   through the window: a false stop would silence a bell nobody heard. Needs an
   add-on that frames announcements as utterances.
 - The device wakes itself less on its own playback: while the speaker holds

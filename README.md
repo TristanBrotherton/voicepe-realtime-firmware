@@ -22,6 +22,7 @@ the backend add-on's OpenAI Realtime or GPT-Live session.
 
 | Firmware (`main`) | Backend add-on | Realtime | GPT-Live (`voice_runtime: live`) |
 |---|---|---|---|
+| 1.3.2 | 0.21.0 and later for "stop" after a timer; older add-ons still work | yes | yes |
 | 1.3.1 | 0.19.0 and later | yes | yes — no firmware change needed; tested on 1.3.1, whose per-turn playback reports (added after 1.2.0) the backend's Live confirmation gate relies on |
 | 1.3.1 | 0.17.x | yes | n/a (the backend has no Live runtime) |
 | 1.2.0 and older | any | yes | not supported: update the firmware first (one click in ESPHome Builder) |
