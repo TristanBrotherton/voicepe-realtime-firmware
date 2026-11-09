@@ -501,6 +501,7 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
       // one without a `done` is reported as prev_utt.
       this->utt_mode_ = false;
       this->utt_discarding_ = false;
+      this->utt_drop_pcm_ = false;
       this->interrupt_seq_ = 0;
       this->text_rx_.reset();
       this->pcm_rx_.reset();
@@ -878,7 +879,7 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len, bool frame_start)
   // interrupt_ack is dropped (the interrupt epoch). Legacy: drop until the
   // next `listening` phase.
   if (this->utt_mode_.load()) {
-    if (this->utt_discarding_.load()) {
+    if (this->utt_discarding_.load() || this->utt_drop_pcm_.load()) {
       this->pcm_rx_.reset();
       return;
     }
@@ -963,8 +964,8 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len, bool frame_start)
   // to guarantee that ordering — len is at most a few KB per WS frame
   // and PSRAM memcpy is ~10–20 µs, well under any audio deadline.
   portENTER_CRITICAL(&this->ring_mux_);
-  if (this->utt_discarding_.load()) {
-    // An interrupt landed while this frame was being scaled: drop it.
+  if (this->utt_discarding_.load() || (this->utt_mode_.load() && this->utt_drop_pcm_.load())) {
+    // An interrupt or a flush landed while this frame was being scaled: drop it.
     portEXIT_CRITICAL(&this->ring_mux_);
     return;
   }
@@ -1234,6 +1235,10 @@ void VaClient::set_phase_(const std::string &phase) {
     if (this->barge_in_ && this->audio_fill_ > 0) {
       UttEvent ev[kMaxUtts];
       size_t n = 0;
+      // The rest of the cut utterance may still be in flight: drop it until
+      // the add-on starts a new one (utt_start).
+      if (this->utt_mode_.load())
+        this->utt_drop_pcm_ = true;
       portENTER_CRITICAL(&this->ring_mux_);
       n = this->utt_flush_locked_(ev, kMaxUtts);
       this->audio_head_ = 0;
@@ -2016,6 +2021,11 @@ void VaClient::send_interrupt(const std::string &reason) {
   UttEvent ev[kMaxUtts];
   size_t n = 0;
   uint32_t target_id = 0, target_fed = 0;
+  // Whatever of the cut utterance arrives after the flush (and after the
+  // interrupt_ack, or if the interrupt could not be sent) is not played: only
+  // a new utt_start is.
+  if (utt)
+    this->utt_drop_pcm_ = true;
   portENTER_CRITICAL(&this->ring_mux_);
   const bool have_target = utt && this->utt_interrupt_target_locked_(target_id, target_fed);
   n = this->utt_flush_locked_(ev, kMaxUtts);
@@ -2238,10 +2248,18 @@ void VaClient::handle_utt_text_(const std::string &msg, bool is_start) {
       ESP_LOGI(TAG, "utterance framing on for this connection");
     if (implicit_end)
       ESP_LOGW(TAG, "utt_start %u before the previous utt_end: previous closed", (unsigned) id);
+    // A new utterance ends the drop of a cut or untracked one's PCM; an
+    // untracked one starts it.
+    this->utt_drop_pcm_ = !tracked;
     if (tracked) {
       ESP_LOGD(TAG, "utt %u start (%s)", (unsigned) id, kind.c_str());
     } else {
-      ESP_LOGW(TAG, "utt %u not tracked: %u utterances queued", (unsigned) id, (unsigned) kMaxUtts);
+      // Every descriptor is in use (descriptors still playing from an earlier
+      // connection count too). Its audio is not played, and the add-on hears
+      // so now instead of waiting for an outcome that would never come.
+      ESP_LOGW(TAG, "utt %u not tracked: %u utterances queued; dropped", (unsigned) id, (unsigned) kMaxUtts);
+      const UttEvent ev{id, UttState::DROPPED, false, k == UttKind::ANNOUNCE, 0, 0, 0};
+      this->send_utt_events_(&ev, 1);
     }
     return;
   }

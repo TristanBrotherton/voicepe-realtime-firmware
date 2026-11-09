@@ -428,6 +428,11 @@ class VaClient : public Component {
   uint64_t ring_out_total_{0};
   std::atomic<bool> utt_mode_{false};
   std::atomic<bool> utt_discarding_{false};
+  // PCM arriving now belongs to no tracked utterance: one whose utt_start
+  // found every descriptor in use (acked `dropped`), or the rest of one a
+  // local flush cut (barge-in, interrupt). Dropped until the next tracked
+  // utt_start; it would otherwise play with no descriptor and no ack.
+  std::atomic<bool> utt_drop_pcm_{false};
   std::atomic<uint32_t> utt_discard_seq_{0};
   uint32_t utt_discard_since_ms_{0};
   static constexpr uint32_t kUttDiscardMaxMs = 10000;  // safety net if an ack is lost
