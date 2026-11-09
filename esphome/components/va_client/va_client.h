@@ -191,7 +191,11 @@ class VaClient : public Component {
   // Queue a JSON text frame for the text sender task if connected (returns
   // false when not connected or the queue is full).
   bool send_text_(const std::string &msg);
-  bool enqueue_text_(const char *data, size_t len);
+  // ack_utt: the frame is the terminal utt_ack (done, cut, dropped) of
+  // utterance ack_id; once it has been written, prev_utt no longer carries it.
+  bool enqueue_text_(const char *data, size_t len, bool ack_utt = false, uint32_t ack_id = 0);
+  // A terminal utt_ack was written to the socket (either sender).
+  void note_terminal_ack_written_(uint32_t id);
   // The interrupt message alone (reason, seq, utt/fed); no local cleanup.
   // In utt mode it also starts discarding until the matching interrupt_ack.
   void send_interrupt_msg_(const char *reason, bool have_utt, uint32_t utt, uint32_t fed);
@@ -338,8 +342,14 @@ class VaClient : public Component {
   // a short TCP stall (the client treats a timed-out write as a network
   // error), and portMAX_DELAY sends could block the main loop or the WS task.
   // One FIFO also keeps the order: an interrupt is never sent behind a later
-  // ack. Each item is a 4-byte connection generation plus the frame; items
-  // queued for an earlier connection are dropped, never sent on a new one.
+  // ack. Each item is a TextTxHdr (connection generation, and whether the
+  // frame is a terminal utt_ack) plus the frame; items queued for an earlier
+  // connection are dropped, never sent on a new one.
+  struct TextTxHdr {
+    uint32_t gen;
+    uint32_t ack_id;
+    uint32_t ack_utt;  // 1: terminal utt_ack of ack_id
+  };
   static constexpr size_t kTextTxBytes = 24 * 1024;
   static constexpr uint32_t kTextTxSendTimeoutMs = kTxStallMaxMs;  // ride out a stall (see kMicTxSendTimeoutMs)
   RingbufHandle_t text_tx_rb_{nullptr};
@@ -429,6 +439,10 @@ class VaClient : public Component {
   uint32_t last_utt_fed_{0};
   uint32_t last_utt_bytes_{0};
   UttState last_utt_st_{UttState::DONE};
+  // True once the add-on can have the latest finished utterance's outcome:
+  // its terminal utt_ack was written to the socket. Until then (the link was
+  // down, the text queue was full, or the frame was dropped as belonging to
+  // a connection that ended) the next `start` carries it as prev_utt.
   bool last_utt_reported_{true};
   std::string prev_utt_json_;
   bool utt_dry_{false};

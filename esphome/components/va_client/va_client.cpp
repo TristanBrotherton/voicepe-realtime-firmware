@@ -1652,7 +1652,7 @@ void VaClient::enroll_stop(bool notify_backend) {
 
 bool VaClient::send_text_(const std::string &msg) { return this->enqueue_text_(msg.data(), msg.size()); }
 
-bool VaClient::enqueue_text_(const char *data, size_t len) {
+bool VaClient::enqueue_text_(const char *data, size_t len, bool ack_utt, uint32_t ack_id) {
   if (!this->ws_connected_ || this->ws_handle_ == nullptr)
     return false;
   if (this->text_tx_task_ == nullptr) {
@@ -1660,22 +1660,31 @@ bool VaClient::enqueue_text_(const char *data, size_t len) {
     // long enough to ride out a TCP stall.
     auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
     const bool ok = esp_websocket_client_send_text(handle, data, static_cast<int>(len),
-                                                   pdMS_TO_TICKS(kTextTxSendTimeoutMs)) >= 0;
+                                                   pdMS_TO_TICKS(kTextTxSendTimeoutMs)) > 0;
     if (!ok)
       this->last_tx_fail_ms_ = millis();
+    else if (ack_utt)
+      this->note_terminal_ack_written_(ack_id);
     return ok;
   }
   void *item = nullptr;
-  if (xRingbufferSendAcquire(this->text_tx_rb_, &item, len + sizeof(uint32_t), 0) != pdTRUE || item == nullptr) {
+  if (xRingbufferSendAcquire(this->text_tx_rb_, &item, len + sizeof(TextTxHdr), 0) != pdTRUE || item == nullptr) {
     this->text_tx_dropped_.fetch_add(1);
     ESP_LOGW(TAG, "text sender queue full: dropped a %u-byte frame", (unsigned) len);
     return false;
   }
-  const uint32_t gen = this->conn_gen_.load();
-  std::memcpy(item, &gen, sizeof(gen));
-  std::memcpy(static_cast<uint8_t *>(item) + sizeof(gen), data, len);
+  TextTxHdr hdr{this->conn_gen_.load(), ack_id, ack_utt ? 1u : 0u};
+  std::memcpy(item, &hdr, sizeof(hdr));
+  std::memcpy(static_cast<uint8_t *>(item) + sizeof(hdr), data, len);
   xRingbufferSendComplete(this->text_tx_rb_, item);
   return true;
+}
+
+void VaClient::note_terminal_ack_written_(uint32_t id) {
+  portENTER_CRITICAL(&this->ring_mux_);
+  if (this->last_utt_valid_ && this->last_utt_id_ == id)
+    this->last_utt_reported_ = true;
+  portEXIT_CRITICAL(&this->ring_mux_);
 }
 
 void VaClient::text_tx_task_fn_(void *arg) { static_cast<VaClient *>(arg)->text_tx_loop_(); }
@@ -1687,24 +1696,28 @@ void VaClient::text_tx_loop_() {
     if (item == nullptr)
       continue;
     this->text_tx_sending_ = true;
-    uint32_t gen = 0;
-    if (len >= sizeof(gen))
-      std::memcpy(&gen, item, sizeof(gen));
+    TextTxHdr hdr{0, 0, 0};
+    if (len >= sizeof(hdr))
+      std::memcpy(&hdr, item, sizeof(hdr));
     auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-    if (len > sizeof(gen) && gen == this->conn_gen_.load() && this->ws_connected_ && handle != nullptr) {
+    if (len > sizeof(hdr) && hdr.gen == this->conn_gen_.load() && this->ws_connected_ && handle != nullptr) {
       const uint32_t t0 = millis();
-      const int sent = esp_websocket_client_send_text(handle, static_cast<const char *>(item) + sizeof(gen),
-                                                      static_cast<int>(len - sizeof(gen)),
+      const int sent = esp_websocket_client_send_text(handle, static_cast<const char *>(item) + sizeof(hdr),
+                                                      static_cast<int>(len - sizeof(hdr)),
                                                       pdMS_TO_TICKS(kTextTxSendTimeoutMs));
       const uint32_t took = millis() - t0;
       if (sent <= 0) {  // 0: the write timed out and the client aborted (see the mic sender)
         this->last_tx_fail_ms_ = millis();
-        ESP_LOGW(TAG, "text send failed after %u ms (%u bytes)", (unsigned) took, (unsigned) (len - sizeof(gen)));
-      } else if (took > 100) {
-        ESP_LOGD(TAG, "text send stalled %u ms (rode it out)", (unsigned) took);
+        ESP_LOGW(TAG, "text send failed after %u ms (%u bytes)", (unsigned) took, (unsigned) (len - sizeof(hdr)));
+      } else {
+        if (hdr.ack_utt != 0)
+          this->note_terminal_ack_written_(hdr.ack_id);
+        if (took > 100)
+          ESP_LOGD(TAG, "text send stalled %u ms (rode it out)", (unsigned) took);
       }
     }
-    // Stale (earlier connection) or not connected: dropped.
+    // Stale (earlier connection) or not connected: dropped. A terminal
+    // utt_ack dropped here stays unreported, so prev_utt carries it.
     vRingbufferReturnItem(this->text_tx_rb_, item);
     this->text_tx_sending_ = false;
   }
@@ -2344,7 +2357,9 @@ void VaClient::utt_service_(uint32_t now_ms, bool chain_dry) {
           this->last_utt_fed_ = fed;
           this->last_utt_bytes_ = u->declared;
           this->last_utt_st_ = UttState::DONE;
-          this->last_utt_reported_ = true;
+          // Reported once its utt_ack is written (note_terminal_ack_written_):
+          // a `done` while the link is down goes out as prev_utt instead.
+          this->last_utt_reported_ = false;
         }
       } else {
         // Underruns: the chain ran dry while this utterance still had bytes
@@ -2470,9 +2485,14 @@ void VaClient::send_utt_events_(const UttEvent *ev, size_t n) {
     if (e.st == UttState::DONE || e.st == UttState::CUT)
       m += ",\"und\":" + std::to_string(e.und);
     m += "}";
-    this->send_text_(m);
+    const bool terminal = !e.progress && e.st != UttState::PLAYING && e.st != UttState::QUEUED;
+    // A terminal ack that cannot be queued (link down, queue full) leaves the
+    // utterance unreported: the next `start` carries it as prev_utt.
+    const bool queued = this->enqueue_text_(m.data(), m.size(), terminal, e.id);
     if (e.progress) {
       ESP_LOGV(TAG, "%s", m.c_str());
+    } else if (!queued && terminal) {
+      ESP_LOGW(TAG, "%s not sent (link down or queue full): reported as prev_utt", m.c_str());
     } else {
       ESP_LOGD(TAG, "%s", m.c_str());
     }
