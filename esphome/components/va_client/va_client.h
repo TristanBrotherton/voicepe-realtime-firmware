@@ -178,7 +178,7 @@ class VaClient : public Component {
   // ring while the session is closed; the ring is DISCARDED (not replayed) on
   // session open — see preroll_discard_pending_.
   void preroll_push_(const int16_t *data, size_t n);
-  void handle_text_(const char *data, size_t len);
+  void handle_text_(const std::string &msg);
   // One piece of a binary frame (frame_start: payload_offset 0). Samples
   // split across pieces are kept whole (pcm_rx_).
   void handle_binary_(const uint8_t *data, size_t len, bool frame_start);

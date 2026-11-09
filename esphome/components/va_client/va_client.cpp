@@ -591,7 +591,7 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
       } else {
         const uint32_t dropped_before = this->text_rx_.dropped();
         if (this->text_rx_.feed(data->data_ptr, len, offset, total, this->text_rx_msg_)) {
-          this->handle_text_(this->text_rx_msg_.data(), this->text_rx_msg_.size());
+          this->handle_text_(this->text_rx_msg_);
         } else if (this->text_rx_.dropped() != dropped_before) {
           ESP_LOGW(TAG, "text frame of %u bytes dropped (too large or a piece missing)",
                    (unsigned) total);
@@ -662,8 +662,8 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
   }
 }
 
-void VaClient::handle_text_(const char *data, size_t len) {
-  std::string msg(data, len);
+void VaClient::handle_text_(const std::string &msg) {
+  // The assembled frame (text_rx_msg_), parsed in place: no per-frame copy.
   ESP_LOGD(TAG, "WS text: %s", msg.c_str());
 
   if (msg.find("\"type\":\"error\"") != std::string::npos) {
@@ -827,10 +827,19 @@ void VaClient::handle_text_(const char *data, size_t len) {
 
   // Substring match on `"value":"<phase>"` — keeps us out of a JSON parser
   // until M3 needs richer payloads.
-  static const char *const kPhases[] = {"listening", "thinking", "replying", "idle"};
-  for (const char *p : kPhases) {
-    std::string needle = std::string("\"value\":\"") + p + "\"";
-    if (msg.find(needle) != std::string::npos) {
+  struct PhaseNeedle {
+    const char *phase;
+    const char *needle;
+  };
+  static const PhaseNeedle kPhases[] = {
+      {"listening", "\"value\":\"listening\""},
+      {"thinking", "\"value\":\"thinking\""},
+      {"replying", "\"value\":\"replying\""},
+      {"idle", "\"value\":\"idle\""},
+  };
+  for (const PhaseNeedle &pn : kPhases) {
+    const char *p = pn.phase;
+    if (msg.find(pn.needle) != std::string::npos) {
       // A silent (admission-declined) turn ends with "followup":false: close
       // the session instead of opening a follow-up listening window.
       if (std::strcmp(p, "idle") == 0 && msg.find("\"followup\":false") != std::string::npos)
