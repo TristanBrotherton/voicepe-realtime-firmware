@@ -416,6 +416,14 @@ void VaClient::connect_() {
   }
   cfg.disable_auto_reconnect = true;  // we drive reconnects ourselves with exponential backoff
   cfg.reconnect_timeout_ms = 5000;    // ignored because disable_auto_reconnect=true
+  // Liveness. The client's defaults (ping every 10 s, give up 120 s after an
+  // unanswered one) left a connection that died quietly (no FIN: the add-on
+  // host went away, the AP dropped us) looking alive for about two minutes,
+  // and a wake in that window went nowhere. The add-on's WebSocket server
+  // answers pings itself. 15 s still rides out the uplink stalls the senders
+  // wait through (kTxStallMaxMs) and a several-second Wi-Fi gap.
+  cfg.ping_interval_sec = kWsPingIntervalS;
+  cfg.pingpong_timeout_sec = kWsPongTimeoutS;
 
   esp_websocket_client_handle_t handle = esp_websocket_client_init(&cfg);
   if (handle == nullptr) {

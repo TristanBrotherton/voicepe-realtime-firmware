@@ -294,6 +294,10 @@ class VaClient : public Component {
   // chime) would spam the user. Require kStableConnectionMs of unbroken
   // uptime before declaring "we're properly back" and re-arming the chime.
   static constexpr uint32_t kStableConnectionMs = 30000;
+  // WebSocket ping cadence and how long a ping may go unanswered before the
+  // connection counts as dead (client defaults: 10 s and 120 s). connect_().
+  static constexpr int kWsPingIntervalS = 5;
+  static constexpr int kWsPongTimeoutS = 15;
 
   // Scratch buffers reused on the hot paths to avoid per-callback heap
   // allocation. Each is OWNED BY ONE TASK — never share them across tasks:
