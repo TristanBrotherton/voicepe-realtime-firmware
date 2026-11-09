@@ -2222,6 +2222,19 @@ va_client:
   # announcements) from reaching the i2s output. The media lane is otherwise
   # unused (no music pipeline configured), so it's effectively ours.
   speaker: media_resampling_speaker
+  # Playback holds (add-ons that frame audio as utterances). After a gap of
+  # over 0.5 s with nothing to play in the middle of a reply (Wi-Fi
+  # interference), the audio that comes back is held until playback_rebuffer
+  # is buffered, so the next dropout doesn't cut the speech at once
+  # (0ms = off). A hold, this one or the add-on's start cushion
+  # (utt_cushion_ms), ends early when nothing new arrived for playback_stall.
+  # playback_cushion_step > 0 makes the cushion adaptive: each such gap adds
+  # a step to every later cushion on the connection, up to
+  # playback_cushion_max; a minute without a gap gives a step back.
+  playback_rebuffer: 300ms
+  playback_stall: 300ms
+  playback_cushion_step: 0ms
+  playback_cushion_max: 1000ms
   on_phase:
     - lambda: |-
         if (phase == "idle") {

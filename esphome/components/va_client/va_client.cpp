@@ -516,6 +516,8 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
       this->utt_mode_ = false;
       this->utt_discarding_ = false;
       this->utt_drop_pcm_ = false;
+      // The adaptive cushion is per connection (it lives on the main loop).
+      this->defer([this]() { this->cushion_adapt_.reset(); });
       this->interrupt_seq_ = 0;
       this->text_rx_.reset();
       this->pcm_rx_.reset();
@@ -2326,12 +2328,38 @@ bool VaClient::utt_start_gate_(uint32_t now_ms) {
   // back-to-back utterance finds the chain still fed and gets no prime.
   const bool chain_cold = this->speaker_->is_stopped() || this->last_fed_ms_ == 0 ||
                           (now_ms - this->last_fed_ms_) > kChainColdMs;
+  const uint32_t since_rx = elapsed_ms(now_ms, this->last_pcm_rx_ms_.load());
+  const uint32_t extra = this->cushion_adapt_.extra_ms();
   bool start_prime = false;
   bool hold = false;
+  bool rebuffered = false;
+  uint32_t rebuffer_id = 0, rebuffer_waited = 0;
+  uint64_t rebuffer_bytes = 0;
   uint32_t id = 0;
   portENTER_CRITICAL(&this->ring_mux_);
   for (size_t i = 0; i < this->utt_count_; i++) {
     Utt *u = this->utt_at_(i);
+    if (u->st == UttState::PLAYING && u->rehold) {
+      // Rebuffer after an audible gap (utt_service_ armed it): the playing
+      // utterance is at the play head and audio is back in the ring.
+      if (u->rehold_rx_ms == 0)
+        u->rehold_rx_ms = now_ms;
+      const uint32_t target =
+          hold_target_ms(std::max(this->rebuffer_ms_, this->utt_cushion_ms_), extra, kUttHoldCapMs);
+      const uint64_t buffered = this->ring_in_total_ - this->ring_out_total_;
+      const uint32_t waited = now_ms - u->rehold_rx_ms;
+      if (playback_hold(buffered, target, u->ended, since_rx, this->hold_stall_ms_, waited,
+                        target + kUttHoldSlackMs)) {
+        hold = true;
+      } else {
+        u->rehold = false;
+        rebuffered = true;
+        rebuffer_id = u->id;
+        rebuffer_waited = waited;
+        rebuffer_bytes = buffered;
+      }
+      break;
+    }
     if (u->st != UttState::QUEUED)
       continue;
     // Only the first queued utterance can be at the play head.
@@ -2342,20 +2370,22 @@ bool VaClient::utt_start_gate_(uint32_t now_ms) {
         start_prime = chain_cold && this->chain_prime_ms_ > 0;
         id = u->id;
       }
-      if (!start_prime && u->cold && this->utt_cushion_ms_ > 0) {
-        // Optional start cushion (hello utt_cushion_ms, default 0): start
-        // once that much is buffered, or the utterance is complete, or
-        // kUttStartDeadlineMs after its first byte.
+      if (!start_prime && u->cold) {
+        // Start cushion on a cold chain (hello utt_cushion_ms, default 0,
+        // plus the adaptive extra): start once that much is buffered, or the
+        // utterance is complete, or nothing new arrived for hold_stall_ms_.
+        const uint32_t target = hold_target_ms(this->utt_cushion_ms_, extra, kUttHoldCapMs);
         const uint64_t avail = u->ended ? u->end_off : this->ring_in_total_;
-        const uint64_t want = (uint64_t) this->utt_cushion_ms_ * (kPlaybackSampleRate / 1000) * 2;
-        const bool deadline = u->first_rx_ms != 0 && now_ms - u->first_rx_ms >= kUttStartDeadlineMs;
-        if (avail - u->start_off < want && !u->ended && !deadline)
-          hold = true;
+        hold = playback_hold(avail - u->start_off, target, u->ended, since_rx, this->hold_stall_ms_,
+                             elapsed_ms(now_ms, u->first_rx_ms), target + kUttHoldSlackMs);
       }
     }
     break;
   }
   portEXIT_CRITICAL(&this->ring_mux_);
+  if (rebuffered)
+    ESP_LOGI(TAG, "utt %u: playing again after a gap (%u ms of audio held for %u ms)", (unsigned) rebuffer_id,
+             (unsigned) (rebuffer_bytes / pcm_ms_to_bytes(1)), (unsigned) rebuffer_waited);
   if (start_prime) {
     this->chain_prime_remaining_ = (size_t) this->chain_prime_ms_ * (kPlaybackSampleRate / 1000) * 2;
     ESP_LOGD(TAG, "utt %u: cold chain — priming %u ms of silence", (unsigned) id,
@@ -2373,6 +2403,7 @@ void VaClient::utt_service_(uint32_t now_ms, bool chain_dry) {
   bool anchor_announce = false;
   int announce_change = -1;  // -1 none, 1 started, 0 ended
   int64_t closed_idle = -1;   // an utterance ended by the safety net below
+  int64_t gap_utt = -1;       // an utterance that just ran dry for an audible gap
   portENTER_CRITICAL(&this->ring_mux_);
   const uint64_t out = this->ring_out_total_;
   bool any_playing = false;
@@ -2426,6 +2457,25 @@ void VaClient::utt_service_(uint32_t now_ms, bool chain_dry) {
         if (!any_playing) {
           if (chain_dry && !this->utt_dry_)
             u->und++;
+          // An audible gap: nothing left in the ring or the chain for
+          // kUttGapMs (the i2s buffer has played out too). What comes back
+          // is held until a cushion is buffered (utt_start_gate_), and the
+          // adaptive cushion grows.
+          if (chain_dry && out >= this->ring_in_total_ && !u->ended) {
+            if (u->dry_since_ms == 0) {
+              u->dry_since_ms = now_ms;
+            } else if (!u->gap_counted && now_ms - u->dry_since_ms >= kUttGapMs) {
+              u->gap_counted = true;  // once per dry interval
+              gap_utt = static_cast<int64_t>(u->id);
+              if (this->rebuffer_ms_ > 0) {
+                u->rehold = true;
+                u->rehold_rx_ms = 0;
+              }
+            }
+          } else {
+            u->dry_since_ms = 0;
+            u->gap_counted = false;
+          }
         }
         any_playing = true;
         if (now_ms - u->last_progress_ms >= 1000) {
@@ -2465,6 +2515,13 @@ void VaClient::utt_service_(uint32_t now_ms, bool chain_dry) {
   if (closed_idle >= 0)
     ESP_LOGW(TAG, "utt %u: no utt_end and no audio for %u ms; ended with what it received",
              (unsigned) closed_idle, (unsigned) kUttOpenIdleMaxMs);
+  if (gap_utt >= 0) {
+    this->cushion_adapt_.on_gap(now_ms);
+    ESP_LOGW(TAG, "utt %u: audible gap (no audio for %u ms)%s; cushion now +%u ms", (unsigned) gap_utt,
+             (unsigned) kUttGapMs, this->rebuffer_ms_ > 0 ? ", rebuffering" : "",
+             (unsigned) this->cushion_adapt_.extra_ms());
+  }
+  this->cushion_adapt_.tick(now_ms);
   if (anchor) {
     // Echo guard anchored at this utterance's first fed byte.
     this->audible_stretch_start_ms_ = now_ms;

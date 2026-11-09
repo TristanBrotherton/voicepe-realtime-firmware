@@ -14,6 +14,7 @@
 #include <freertos/ringbuf.h>
 #include <freertos/task.h>
 
+#include "utt_gate.h"
 #include "ws_disc.h"
 #include "ws_rx.h"
 
@@ -52,6 +53,17 @@ class VaClient : public Component {
   // HA api: block on this firmware — there's no remote slider.) Range
   // [0, 1]; values are clamped on read so callers don't have to bounds-check.
   void set_volume(float v) { volume_ = v; }
+  // Utterance playback holds (utt_gate.h; add-ons with utterance framing).
+  // rebuffer_ms: after an audible gap mid-utterance, hold the audio that
+  // comes back until this much is buffered (0 = off). stall_ms: a hold ends
+  // when nothing new arrived for this long. Cushion adapt: each audible gap
+  // adds step_ms to every later cushion on this connection, up to max_ms;
+  // a minute without one gives a step back (step_ms 0 = off).
+  void set_playback_rebuffer_ms(uint32_t ms) { rebuffer_ms_ = ms; }
+  void set_playback_stall_ms(uint32_t ms) { hold_stall_ms_ = ms; }
+  void set_playback_cushion_adapt(uint32_t step_ms, uint32_t max_ms) {
+    cushion_adapt_.configure(step_ms, max_ms, kCushionDecayMs);
+  }
   void add_on_phase_trigger(OnPhaseTrigger *t) { phase_triggers_.push_back(t); }
   void add_on_repeated_failure_trigger(OnRepeatedFailureTrigger *t) {
     repeated_failure_triggers_.push_back(t);
@@ -409,6 +421,10 @@ class VaClient : public Component {
     bool start_checked{false};
     bool cold{false};
     bool orphan{false};      // from an earlier connection: tracked, never acked
+    uint32_t dry_since_ms{0};  // ring and chain empty while playing, since (0 = not dry)
+    bool gap_counted{false};   // this dry interval was already counted as a gap
+    bool rehold{false};        // ran dry for an audible gap: hold what comes back
+    uint32_t rehold_rx_ms{0};  // the rebuffer hold's first tick with audio
   };
   struct UttEvent {
     uint32_t id;
@@ -474,7 +490,21 @@ class VaClient : public Component {
   uint32_t utt_cushion_ms_{0};
   static constexpr uint32_t kChainPrimeMaxMs = 600;
   static constexpr uint32_t kUttCushionMaxMs = 1000;
-  static constexpr uint32_t kUttStartDeadlineMs = 300;
+  // Playback holds (utt_gate.h). A start cushion used to end 300 ms after
+  // the first byte whatever had arrived, so with a real-time source no
+  // cushion beyond about 300 ms could build. A hold now ends when its cushion
+  // is buffered, the utterance has ended, or nothing new came for
+  // hold_stall_ms_; the slack is only a cap for a source slower than real time.
+  uint32_t rebuffer_ms_{300};
+  uint32_t hold_stall_ms_{300};
+  CushionAdapt cushion_adapt_;
+  static constexpr uint32_t kUttHoldSlackMs = 1000;   // hold cap = target + this
+  static constexpr uint32_t kUttHoldCapMs = 2000;     // largest cushion, base + adaptive
+  static constexpr uint32_t kCushionDecayMs = 60000;  // a minute without a gap gives a step back
+  // Ring and chain dry this long while an utterance still has audio to come
+  // counts as an audible gap: longer than the i2s buffer (500 ms in the
+  // package) that keeps playing after the resampler and mixer ran dry.
+  static constexpr uint32_t kUttGapMs = 500;
   Utt *utt_at_(size_t i) { return &this->utts_[(this->utt_first_ + i) % kMaxUtts]; }
   static UttKind utt_kind_from_(const std::string &k);
   static const char *utt_state_name_(UttState st);

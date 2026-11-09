@@ -19,6 +19,10 @@ CONF_ON_REPEATED_FAILURE = "on_repeated_failure"
 CONF_ON_FOLLOWUP_OPENED = "on_followup_opened"
 CONF_ON_AUDIBLE_ERROR = "on_audible_error"
 CONF_ON_ANNOUNCE = "on_announce"
+CONF_PLAYBACK_REBUFFER = "playback_rebuffer"
+CONF_PLAYBACK_STALL = "playback_stall"
+CONF_PLAYBACK_CUSHION_STEP = "playback_cushion_step"
+CONF_PLAYBACK_CUSHION_MAX = "playback_cushion_max"
 
 va_client_ns = cg.esphome_ns.namespace("va_client")
 VaClient = va_client_ns.class_("VaClient", cg.Component)
@@ -53,6 +57,31 @@ CONFIG_SCHEMA = cv.Schema(
         # Reported to the backend in the wake message so turn timelines and
         # wake statistics can be split by firmware version.
         cv.Optional(CONF_FIRMWARE_VERSION, default=""): cv.string,
+        # Playback holds, with an add-on that frames its audio as utterances.
+        # After a gap of over 0.5 s with nothing to play mid-utterance, the
+        # audio that comes back is held until this much is buffered, so the
+        # next dropout does not cut the speech straight away (0 = off).
+        cv.Optional(CONF_PLAYBACK_REBUFFER, default="300ms"): cv.All(
+            cv.positive_time_period_milliseconds,
+            cv.Range(max=cv.TimePeriod(milliseconds=2000)),
+        ),
+        # A hold (that one, or the add-on's start cushion utt_cushion_ms)
+        # ends early when nothing new arrived for this long.
+        cv.Optional(CONF_PLAYBACK_STALL, default="300ms"): cv.All(
+            cv.positive_time_period_milliseconds,
+            cv.Range(min=cv.TimePeriod(milliseconds=50), max=cv.TimePeriod(milliseconds=2000)),
+        ),
+        # Adaptive cushion: each such gap adds this much to every later
+        # cushion on the connection, up to playback_cushion_max; a minute
+        # without a gap gives a step back. 0 = off.
+        cv.Optional(CONF_PLAYBACK_CUSHION_STEP, default="0ms"): cv.All(
+            cv.positive_time_period_milliseconds,
+            cv.Range(max=cv.TimePeriod(milliseconds=1000)),
+        ),
+        cv.Optional(CONF_PLAYBACK_CUSHION_MAX, default="1000ms"): cv.All(
+            cv.positive_time_period_milliseconds,
+            cv.Range(max=cv.TimePeriod(milliseconds=2000)),
+        ),
         cv.Optional(CONF_ON_PHASE): automation.validate_automation(
             {
                 cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(OnPhaseTrigger),
@@ -108,6 +137,14 @@ async def to_code(config):
     cg.add(var.set_barge_in(config[CONF_BARGE_IN]))
     cg.add(var.set_token(config[CONF_TOKEN]))
     cg.add(var.set_firmware_version(config[CONF_FIRMWARE_VERSION]))
+    cg.add(var.set_playback_rebuffer_ms(config[CONF_PLAYBACK_REBUFFER].total_milliseconds))
+    cg.add(var.set_playback_stall_ms(config[CONF_PLAYBACK_STALL].total_milliseconds))
+    cg.add(
+        var.set_playback_cushion_adapt(
+            config[CONF_PLAYBACK_CUSHION_STEP].total_milliseconds,
+            config[CONF_PLAYBACK_CUSHION_MAX].total_milliseconds,
+        )
+    )
 
     mic = await cg.get_variable(config[CONF_MICROPHONE])
     cg.add(var.set_microphone(mic))
