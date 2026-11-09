@@ -197,8 +197,9 @@ class VaClient : public Component {
   // A terminal utt_ack was written to the socket (either sender).
   void note_terminal_ack_written_(uint32_t id);
   // The interrupt message alone (reason, seq, utt/fed); no local cleanup.
-  // In utt mode it also starts discarding until the matching interrupt_ack.
-  void send_interrupt_msg_(const char *reason, bool have_utt, uint32_t utt, uint32_t fed);
+  // In utt mode it also starts discarding until the matching interrupt_ack,
+  // but only if the message was queued (false: not sent, nothing armed).
+  bool send_interrupt_msg_(const char *reason, bool have_utt, uint32_t utt, uint32_t fed);
   // Under ring_mux_: the utterance an interrupt refers to (the playing one,
   // else the latest finished one). False if none.
   bool utt_interrupt_target_locked_(uint32_t &id, uint32_t &fed);
@@ -351,6 +352,9 @@ class VaClient : public Component {
     uint32_t ack_utt;  // 1: terminal utt_ack of ack_id
   };
   static constexpr size_t kTextTxBytes = 24 * 1024;
+  // Bulk frames (trigger audio) leave this much of the queue free, so an
+  // interrupt, an ack or a flush can always be queued behind them.
+  static constexpr size_t kTextTxReserveBytes = 4 * 1024;
   static constexpr uint32_t kTextTxSendTimeoutMs = kTxStallMaxMs;  // ride out a stall (see kMicTxSendTimeoutMs)
   RingbufHandle_t text_tx_rb_{nullptr};
   TaskHandle_t text_tx_task_{nullptr};

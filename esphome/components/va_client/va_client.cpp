@@ -1816,8 +1816,9 @@ void VaClient::send_trigger_chunks_() {
     }
     // Through the text sender. A full queue is back-pressure: retry this
     // chunk on a later loop pass (the sender drains at link speed).
+    // kTextTxReserveBytes stays free for control frames (interrupt, acks).
     if (this->text_tx_rb_ != nullptr && this->text_tx_task_ != nullptr &&
-        xRingbufferGetCurFreeSize(this->text_tx_rb_) < len + 16)
+        xRingbufferGetCurFreeSize(this->text_tx_rb_) < len + sizeof(TextTxHdr) + 16 + kTextTxReserveBytes)
       return;
     if (!this->enqueue_text_(buf, len)) {
       ESP_LOGW(TAG, "trigger snippet not sent (chunk %u)", (unsigned) (this->snapshot_sent_samples_ / kTriggerChunkSamples));
@@ -1993,7 +1994,12 @@ void VaClient::send_interrupt(const std::string &reason) {
   const bool utt = this->utt_mode_.load();
   // Utterance framing: from here until the add-on's interrupt_ack, every
   // utt_* and binary frame is dropped (set before the flush so a frame being
-  // written right now can't land in the flushed ring).
+  // written right now can't land in the flushed ring). Undone below if the
+  // interrupt cannot be queued: no ack would come, and every utterance for
+  // the next kUttDiscardMaxMs would be dropped.
+  const bool was_discarding = this->utt_discarding_.load();
+  const uint32_t was_discard_seq = this->utt_discard_seq_.load();
+  const uint32_t was_discard_since = this->utt_discard_since_ms_;
   if (utt && connected) {
     this->utt_discard_seq_ = this->interrupt_seq_ + 1;
     this->utt_discard_since_ms_ = millis();
@@ -2025,7 +2031,11 @@ void VaClient::send_interrupt(const std::string &reason) {
   // room the instant we reconnected. The interrupt goes out before the acks
   // for the utterances it cut (one FIFO keeps that order).
   if (connected) {
-    this->send_interrupt_msg_(reason.c_str(), have_target, target_id, target_fed);
+    if (!this->send_interrupt_msg_(reason.c_str(), have_target, target_id, target_fed) && utt) {
+      this->utt_discard_seq_ = was_discard_seq;
+      this->utt_discard_since_ms_ = was_discard_since;
+      this->utt_discarding_ = was_discarding;
+    }
   } else {
     ESP_LOGW(TAG, "send_interrupt: WS not connected — local cleanup only");
   }
@@ -2102,9 +2112,9 @@ std::string VaClient::build_start_msg_() {
   return m;
 }
 
-void VaClient::send_interrupt_msg_(const char *reason, bool have_utt, uint32_t utt, uint32_t fed) {
+bool VaClient::send_interrupt_msg_(const char *reason, bool have_utt, uint32_t utt, uint32_t fed) {
   if (!this->ws_connected_ || this->ws_handle_ == nullptr)
-    return;
+    return false;
   const uint32_t seq = ++this->interrupt_seq_;
   std::string m = "{\"type\":\"interrupt\"";
   if (reason != nullptr && reason[0] != '\0')
@@ -2113,14 +2123,29 @@ void VaClient::send_interrupt_msg_(const char *reason, bool have_utt, uint32_t u
   if (have_utt)
     m += ",\"utt\":" + std::to_string(utt) + ",\"fed\":" + std::to_string(fed);
   m += "}";
-  if (this->utt_mode_.load()) {
-    // Drop utt_* and binary frames until the add-on acks this interrupt.
+  // Drop utt_* and binary frames until the add-on acks this interrupt. Armed
+  // before queueing (the ack can't then beat the arming), and put back as it
+  // was if the interrupt could not be queued: no ack would ever come.
+  const bool utt_mode = this->utt_mode_.load();
+  const bool was_discarding = this->utt_discarding_.load();
+  const uint32_t was_seq = this->utt_discard_seq_.load();
+  const uint32_t was_since = this->utt_discard_since_ms_;
+  if (utt_mode) {
     this->utt_discard_seq_ = seq;
     this->utt_discard_since_ms_ = millis();
     this->utt_discarding_ = true;
   }
-  this->send_text_(m);
+  if (!this->send_text_(m)) {
+    if (utt_mode) {
+      this->utt_discard_seq_ = was_seq;
+      this->utt_discard_since_ms_ = was_since;
+      this->utt_discarding_ = was_discarding;
+    }
+    ESP_LOGW(TAG, "interrupt not sent (queue full or link down): %s", m.c_str());
+    return false;
+  }
   ESP_LOGI(TAG, "interrupt sent: %s", m.c_str());
+  return true;
 }
 
 bool VaClient::announce_stop_window() const {
