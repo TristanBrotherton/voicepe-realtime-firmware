@@ -426,6 +426,9 @@ class VaClient : public Component {
   int open_utt_{-1};      // descriptor receiving binary frames (WS task), -1 none
   uint64_t ring_in_total_{0};
   uint64_t ring_out_total_{0};
+  // Bumped (under ring_mux_) by every flush of the playback ring, so loop()
+  // can tell a flush happened while it was outside the lock in play().
+  uint32_t ring_epoch_{0};
   std::atomic<bool> utt_mode_{false};
   std::atomic<bool> utt_discarding_{false};
   // PCM arriving now belongs to no tracked utterance: one whose utt_start

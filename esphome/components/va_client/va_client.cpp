@@ -171,6 +171,7 @@ void VaClient::loop() {
     size_t head = this->audio_head_;
     size_t tail = this->audio_tail_;
     size_t fill = this->audio_fill_;
+    const uint32_t epoch = this->ring_epoch_;
     portEXIT_CRITICAL(&this->ring_mux_);
     if (fill > 0 && this->utt_mode_.load()) {
       // Utterance framing: the per-utterance start rule (cold prime from
@@ -277,11 +278,24 @@ void VaClient::loop() {
         // real reply audio reaches this path.
         if (this->reply_t_first_audible_ == 0 && this->reply_t_first_audio_ != 0)
           this->reply_t_first_audible_ = this->last_fed_ms_;
+        // The WS task can flush the ring (a barge-in `listening`) while play()
+        // runs: then the ring was reset under us and these bytes are no longer
+        // in it. Advancing anyway would underflow audio_fill_ and push
+        // ring_out_total_ past ring_in_total_.
+        bool flushed = false;
         portENTER_CRITICAL(&this->ring_mux_);
-        this->audio_head_ = (this->audio_head_ + accepted) % kAudioBufBytes;
-        this->audio_fill_ -= accepted;
-        this->ring_out_total_ += accepted;
+        if (this->ring_epoch_ != epoch) {
+          flushed = true;
+        } else {
+          if (accepted > this->audio_fill_)
+            accepted = this->audio_fill_;
+          this->audio_head_ = (this->audio_head_ + accepted) % kAudioBufBytes;
+          this->audio_fill_ -= accepted;
+          this->ring_out_total_ += accepted;
+        }
         portEXIT_CRITICAL(&this->ring_mux_);
+        if (flushed)
+          ESP_LOGD(TAG, "ring flushed during play(): %u bytes not accounted", (unsigned) accepted);
         static uint32_t dbg_last = 0;
         uint32_t now = millis();
         if (now - dbg_last >= 500) {
@@ -1241,6 +1255,7 @@ void VaClient::set_phase_(const std::string &phase) {
         this->utt_drop_pcm_ = true;
       portENTER_CRITICAL(&this->ring_mux_);
       n = this->utt_flush_locked_(ev, kMaxUtts);
+      this->ring_epoch_++;
       this->audio_head_ = 0;
       this->audio_tail_ = 0;
       this->audio_fill_ = 0;
@@ -2029,6 +2044,7 @@ void VaClient::send_interrupt(const std::string &reason) {
   portENTER_CRITICAL(&this->ring_mux_);
   const bool have_target = utt && this->utt_interrupt_target_locked_(target_id, target_fed);
   n = this->utt_flush_locked_(ev, kMaxUtts);
+  this->ring_epoch_++;
   this->audio_head_ = 0;
   this->audio_tail_ = 0;
   this->audio_fill_ = 0;
