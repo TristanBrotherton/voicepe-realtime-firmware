@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.3.3
+
+- A short gap in arriving reply audio no longer cuts the reply. When the
+  speaker runs dry mid-reply, the audio that comes back is held until
+  `playback_rebuffer` (300 ms) has built up, or until nothing new has arrived
+  for `playback_stall` (300 ms), then it plays on. `playback_cushion_step`
+  (0, off) makes the start cushion adaptive: each such gap adds a step, up to
+  `playback_cushion_max` (1 s), and a minute without a gap takes one back.
+- A flush while audio is playing no longer corrupts the playback ring's
+  counters.
+- Audio for an utterance the device never got a start for is dropped and the
+  start is answered `dropped`; audio that arrives after a flush is dropped too.
+- After an interrupt, queued audio is discarded only if the interrupt itself
+  was queued, and 4 KB of the send queue is kept for control frames.
+- A `done` the add-on never received is sent again as `prev_utt` with the next
+  utterance.
+- The connection is pinged every 5 s and a link with no pong for 15 s is
+  dropped, so a dead link is noticed in seconds instead of minutes.
+- Text frames are parsed in place, without a copy.
+
 ## 1.3.2
 
 - "Stop" after a timer announcement reaches the add-on, so a heard timer does
