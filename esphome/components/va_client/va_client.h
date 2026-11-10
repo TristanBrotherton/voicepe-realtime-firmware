@@ -14,6 +14,7 @@
 #include <freertos/ringbuf.h>
 #include <freertos/task.h>
 
+#include "utt_gate.h"
 #include "ws_disc.h"
 #include "ws_rx.h"
 
@@ -52,6 +53,17 @@ class VaClient : public Component {
   // HA api: block on this firmware — there's no remote slider.) Range
   // [0, 1]; values are clamped on read so callers don't have to bounds-check.
   void set_volume(float v) { volume_ = v; }
+  // Utterance playback holds (utt_gate.h; add-ons with utterance framing).
+  // rebuffer_ms: after an audible gap mid-utterance, hold the audio that
+  // comes back until this much is buffered (0 = off). stall_ms: a hold ends
+  // when nothing new arrived for this long. Cushion adapt: each audible gap
+  // adds step_ms to every later cushion on this connection, up to max_ms;
+  // a minute without one gives a step back (step_ms 0 = off).
+  void set_playback_rebuffer_ms(uint32_t ms) { rebuffer_ms_ = ms; }
+  void set_playback_stall_ms(uint32_t ms) { hold_stall_ms_ = ms; }
+  void set_playback_cushion_adapt(uint32_t step_ms, uint32_t max_ms) {
+    cushion_adapt_.configure(step_ms, max_ms, kCushionDecayMs);
+  }
   void add_on_phase_trigger(OnPhaseTrigger *t) { phase_triggers_.push_back(t); }
   void add_on_repeated_failure_trigger(OnRepeatedFailureTrigger *t) {
     repeated_failure_triggers_.push_back(t);
@@ -178,7 +190,7 @@ class VaClient : public Component {
   // ring while the session is closed; the ring is DISCARDED (not replayed) on
   // session open — see preroll_discard_pending_.
   void preroll_push_(const int16_t *data, size_t n);
-  void handle_text_(const char *data, size_t len);
+  void handle_text_(const std::string &msg);
   // One piece of a binary frame (frame_start: payload_offset 0). Samples
   // split across pieces are kept whole (pcm_rx_).
   void handle_binary_(const uint8_t *data, size_t len, bool frame_start);
@@ -191,10 +203,15 @@ class VaClient : public Component {
   // Queue a JSON text frame for the text sender task if connected (returns
   // false when not connected or the queue is full).
   bool send_text_(const std::string &msg);
-  bool enqueue_text_(const char *data, size_t len);
+  // ack_utt: the frame is the terminal utt_ack (done, cut, dropped) of
+  // utterance ack_id; once it has been written, prev_utt no longer carries it.
+  bool enqueue_text_(const char *data, size_t len, bool ack_utt = false, uint32_t ack_id = 0);
+  // A terminal utt_ack was written to the socket (either sender).
+  void note_terminal_ack_written_(uint32_t id);
   // The interrupt message alone (reason, seq, utt/fed); no local cleanup.
-  // In utt mode it also starts discarding until the matching interrupt_ack.
-  void send_interrupt_msg_(const char *reason, bool have_utt, uint32_t utt, uint32_t fed);
+  // In utt mode it also starts discarding until the matching interrupt_ack,
+  // but only if the message was queued (false: not sent, nothing armed).
+  bool send_interrupt_msg_(const char *reason, bool have_utt, uint32_t utt, uint32_t fed);
   // Under ring_mux_: the utterance an interrupt refers to (the playing one,
   // else the latest finished one). False if none.
   bool utt_interrupt_target_locked_(uint32_t &id, uint32_t &fed);
@@ -294,6 +311,10 @@ class VaClient : public Component {
   // chime) would spam the user. Require kStableConnectionMs of unbroken
   // uptime before declaring "we're properly back" and re-arming the chime.
   static constexpr uint32_t kStableConnectionMs = 30000;
+  // WebSocket ping cadence and how long a ping may go unanswered before the
+  // connection counts as dead (client defaults: 10 s and 120 s). connect_().
+  static constexpr int kWsPingIntervalS = 5;
+  static constexpr int kWsPongTimeoutS = 15;
 
   // Scratch buffers reused on the hot paths to avoid per-callback heap
   // allocation. Each is OWNED BY ONE TASK — never share them across tasks:
@@ -334,9 +355,18 @@ class VaClient : public Component {
   // a short TCP stall (the client treats a timed-out write as a network
   // error), and portMAX_DELAY sends could block the main loop or the WS task.
   // One FIFO also keeps the order: an interrupt is never sent behind a later
-  // ack. Each item is a 4-byte connection generation plus the frame; items
-  // queued for an earlier connection are dropped, never sent on a new one.
+  // ack. Each item is a TextTxHdr (connection generation, and whether the
+  // frame is a terminal utt_ack) plus the frame; items queued for an earlier
+  // connection are dropped, never sent on a new one.
+  struct TextTxHdr {
+    uint32_t gen;
+    uint32_t ack_id;
+    uint32_t ack_utt;  // 1: terminal utt_ack of ack_id
+  };
   static constexpr size_t kTextTxBytes = 24 * 1024;
+  // Bulk frames (trigger audio) leave this much of the queue free, so an
+  // interrupt, an ack or a flush can always be queued behind them.
+  static constexpr size_t kTextTxReserveBytes = 4 * 1024;
   static constexpr uint32_t kTextTxSendTimeoutMs = kTxStallMaxMs;  // ride out a stall (see kMicTxSendTimeoutMs)
   RingbufHandle_t text_tx_rb_{nullptr};
   TaskHandle_t text_tx_task_{nullptr};
@@ -391,6 +421,10 @@ class VaClient : public Component {
     bool start_checked{false};
     bool cold{false};
     bool orphan{false};      // from an earlier connection: tracked, never acked
+    uint32_t dry_since_ms{0};  // ring and chain empty while playing, since (0 = not dry)
+    bool gap_counted{false};   // this dry interval was already counted as a gap
+    bool rehold{false};        // ran dry for an audible gap: hold what comes back
+    uint32_t rehold_rx_ms{0};  // the rebuffer hold's first tick with audio
   };
   struct UttEvent {
     uint32_t id;
@@ -408,8 +442,16 @@ class VaClient : public Component {
   int open_utt_{-1};      // descriptor receiving binary frames (WS task), -1 none
   uint64_t ring_in_total_{0};
   uint64_t ring_out_total_{0};
+  // Bumped (under ring_mux_) by every flush of the playback ring, so loop()
+  // can tell a flush happened while it was outside the lock in play().
+  uint32_t ring_epoch_{0};
   std::atomic<bool> utt_mode_{false};
   std::atomic<bool> utt_discarding_{false};
+  // PCM arriving now belongs to no tracked utterance: one whose utt_start
+  // found every descriptor in use (acked `dropped`), or the rest of one a
+  // local flush cut (barge-in, interrupt). Dropped until the next tracked
+  // utt_start; it would otherwise play with no descriptor and no ack.
+  std::atomic<bool> utt_drop_pcm_{false};
   std::atomic<uint32_t> utt_discard_seq_{0};
   uint32_t utt_discard_since_ms_{0};
   static constexpr uint32_t kUttDiscardMaxMs = 10000;  // safety net if an ack is lost
@@ -425,6 +467,10 @@ class VaClient : public Component {
   uint32_t last_utt_fed_{0};
   uint32_t last_utt_bytes_{0};
   UttState last_utt_st_{UttState::DONE};
+  // True once the add-on can have the latest finished utterance's outcome:
+  // its terminal utt_ack was written to the socket. Until then (the link was
+  // down, the text queue was full, or the frame was dropped as belonging to
+  // a connection that ended) the next `start` carries it as prev_utt.
   bool last_utt_reported_{true};
   std::string prev_utt_json_;
   bool utt_dry_{false};
@@ -444,7 +490,21 @@ class VaClient : public Component {
   uint32_t utt_cushion_ms_{0};
   static constexpr uint32_t kChainPrimeMaxMs = 600;
   static constexpr uint32_t kUttCushionMaxMs = 1000;
-  static constexpr uint32_t kUttStartDeadlineMs = 300;
+  // Playback holds (utt_gate.h). A start cushion used to end 300 ms after
+  // the first byte whatever had arrived, so with a real-time source no
+  // cushion beyond about 300 ms could build. A hold now ends when its cushion
+  // is buffered, the utterance has ended, or nothing new came for
+  // hold_stall_ms_; the slack is only a cap for a source slower than real time.
+  uint32_t rebuffer_ms_{300};
+  uint32_t hold_stall_ms_{300};
+  CushionAdapt cushion_adapt_;
+  static constexpr uint32_t kUttHoldSlackMs = 1000;   // hold cap = target + this
+  static constexpr uint32_t kUttHoldCapMs = 2000;     // largest cushion, base + adaptive
+  static constexpr uint32_t kCushionDecayMs = 60000;  // a minute without a gap gives a step back
+  // Ring and chain dry this long while an utterance still has audio to come
+  // counts as an audible gap: longer than the i2s buffer (500 ms in the
+  // package) that keeps playing after the resampler and mixer ran dry.
+  static constexpr uint32_t kUttGapMs = 500;
   Utt *utt_at_(size_t i) { return &this->utts_[(this->utt_first_ + i) % kMaxUtts]; }
   static UttKind utt_kind_from_(const std::string &k);
   static const char *utt_state_name_(UttState st);
